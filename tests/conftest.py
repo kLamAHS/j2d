@@ -1,0 +1,121 @@
+import sys
+import zipfile
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+#: A miniature archive mirroring the real member names and column layouts, so
+#: the whole pipeline can be exercised without the 1.2 GB download. It embeds
+#: the two defects found in the real extract: a NUL run inside a quoted field
+#: and an invalid UTF-8 byte.
+FACILITY = (
+    b'"FRS_FACILITY_DETAIL_REPORT_URL","REGISTRY_ID","PRIMARY_NAME","LOCATION_ADDRESS",'
+    b'"SUPPLEMENTAL_LOCATION","CITY_NAME","COUNTY_NAME","FIPS_CODE","STATE_CODE",'
+    b'"STATE_NAME","COUNTRY_NAME","POSTAL_CODE","FEDERAL_FACILITY_CODE","FEDERAL_AGENCY_NAME",'
+    b'"TRIBAL_LAND_CODE","TRIBAL_LAND_NAME","CONGRESSIONAL_DIST_NUM","CENSUS_BLOCK_CODE",'
+    b'"HUC_CODE","EPA_REGION_CODE","SITE_TYPE_NAME","LOCATION_DESCRIPTION","CREATE_DATE",'
+    b'"UPDATE_DATE","US_MEXICO_BORDER_IND","PGM_SYS_ACRNMS","LATITUDE83","LONGITUDE83",'
+    b'"CONVEYOR","COLLECT_DESC","ACCURACY_VALUE","REF_POINT_DESC","HDATUM_DESC","SOURCE_DESC"\n'
+    b'"http://x/1","110000000001","ACME  WORKS ","1 MAIN ST","","NILES","TRUMBULL","39155",'
+    b'"OH","OHIO","UNITED STATES","44446-1199","","","","","","","","5","STATIONARY","",'
+    b'"01-MAR-00","23-MAY-25","","SFDW:OH1234567, NPDES:OH0011223, RCRAINFO:OHD004228631",'
+    b'"41.18","-80.76","","","","","NAD83",""\n'
+    b'"http://x/2","110000000002","BAD STATE CO","2 OAK AVE","","EL DORADO","UNION","05139",'
+    b'"XX","ARKANSAS","USA","71730","","","","","","","","6","STATIONARY","",'
+    b'"15-JUN-99","01-JAN-55","","SFDW:AR9876543 4242","","","","","","","NAD83",""\n'
+)
+ENV_INTEREST = (
+    b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","INTEREST_TYPE","FED_STATE_CODE",'
+    b'"START_DATE","START_DATE_QUALIFIER","END_DATE","END_DATE_QUALIFIER","SOURCE_OF_DATA",'
+    b'"LAST_REPORTED_DATE","CREATE_DATE","UPDATE_DATE","ACTIVE_STATUS"\n'
+    b'"110000000001","SFDW","OH1234567","COMMUNITY WATER SYSTEM","FEDERAL","29-JAN-09",'
+    b'"ORIGINAL PERMIT ISSUE DATE","01-JAN-35","PERMIT EXPIRATION DATE","SDWIS","","18-AUG-15","","ACTIVE"\n'
+    b'"110000000001","NPDES","OH0011223","ICIS-NPDES NON-MAJOR","FEDERAL","","","","","ICIS","","","","ACTIVE"\n'
+    b'"110000000002","SFDW","AR9876543 4242","WATER TREATMENT PLANT","FEDERAL","","","","","SDWIS","","","","INACTIVE"\n'
+    b'"110000000009","SFDW","ZZ0000000","COMMUNITY WATER SYSTEM","FEDERAL","","","","","SDWIS","","","","ACTIVE"\n'
+)
+# MAILING_ADDRESS row 2 carries 27 NULs, exactly as the real extract does.
+MAILING = (
+    b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","INTEREST_TYPE","AFFILIATION_TYPE",'
+    b'"START_DATE","END_DATE","MAILING_ADDRESS","SUPPLEMENTAL_ADDRESS","CITY_NAME",'
+    b'"STATE_CODE","STATE_NAME","POSTAL_CODE","COUNTRY_NAME"\n'
+    b'"110000000001","NPDES","OH0011223","ICIS-NPDES NON-MAJOR","MAILING ADDRESS","","","'
+    + b"\x00" * 27
+    + b'","403 NORTH MAIN ST","NILES","OH","OHIO","44446","UNITED STATES"\n'
+    b'"110000000001","TRIS","44446X","TRI REPORTER","MAILING ADDRESS","03-JUL-00","",'
+    b'"1210 NORTH PARK AVE","","WARREN","OH","OHIO","444831400","UNITED STATES"\n'
+)
+# ALTERNATIVE_NAME row 1 carries a raw Latin-1 byte (0xB0) - invalid UTF-8.
+ALT_NAME = (
+    b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","ALTERNATIVE_NAME","ALTERNATIVE_NAME_TYPE"\n'
+    b'"110000000001","TRIS","44446X","ACME 90\xb0 WORKS","PROGRAM NAME"\n'
+)
+SIMPLE = {
+    "NATIONAL_NAICS_FILE.CSV": (
+        b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","INTEREST_TYPE","NAICS_CODE",'
+        b'"PRIMARY_INDICATOR","CODE_DESCRIPTION"\n'
+        b'"110000000001","NPDES","OH0011223","ICIS-NPDES NON-MAJOR","221310","PRIMARY","WATER SUPPLY"\n'
+    ),
+    "NATIONAL_SIC_FILE.CSV": (
+        b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","INTEREST_TYPE","SIC_CODE",'
+        b'"PRIMARY_INDICATOR","CODE_DESCRIPTION"\n'
+        b'"110000000001","NPDES","OH0011223","ICIS-NPDES NON-MAJOR","4941","PRIMARY","WATER SUPPLY"\n'
+    ),
+    "NATIONAL_SUPP_INTEREST_FILE.CSV": (
+        b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","INTEREST_TYPE","SUP_PGM_SYS_ACRNM",'
+        b'"SUP_PGM_SYS_ID","SUP_INTEREST_TYPE","START_DATE","START_DATE_QUALIFIER","END_DATE",'
+        b'"END_DATE_QUALIFIER","SOURCE_OF_DATA","LAST_REPORTED_DATE","REPORTED_SUP_INTEREST_TYPE",'
+        b'"CREATE_DATE","UPDATE_DATE"\n'
+        b'"110000000001","NPDES","OH0011223","ICIS-NPDES NON-MAJOR","ICIS","","ENFORCEMENT",'
+        b'"10-FEB-11","ACTUAL ACTIVITY DATE","","","ICIS","","ENFORCEMENT","01-JUN-11",""\n'
+    ),
+    "NATIONAL_CONTACT_FILE.CSV": (
+        b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","INTEREST_TYPE","AFFILIATION_TYPE",'
+        b'"START_DATE","END_DATE","FULL_NAME","TITLE","PHONE_NUMBER","ALTERNATE_PHONE",'
+        b'"FAX_NUMBER","EMAIL_ADDRESS","MAILING_ADDRESS","SUPPLEMENTAL_ADDRESS","CITY_NAME",'
+        b'"STATE_CODE","STATE_NAME","POSTAL_CODE","COUNTRY_NAME"\n'
+        b'"110000000001","NPDES","OH0011223","ICIS-NPDES NON-MAJOR","SITE CONTACT","","",'
+        b'"JANE DOE","MANAGER","5551234567","","","JANE@EXAMPLE.COM","","","","","","",""\n'
+    ),
+    "NATIONAL_ORGANIZATION_FILE.CSV": (
+        b'"REGISTRY_ID","PGM_SYS_ACRNM","PGM_SYS_ID","INTEREST_TYPE","AFFILIATION_TYPE",'
+        b'"START_DATE","END_DATE","ORG_NAME","ORG_TYPE","DUNS_NUMBER","DIVISION_NAME",'
+        b'"PHONE_NUMBER","ALTERNATE_PHONE","FAX_NUMBER","EMAIL_ADDRESS","EIN","STATE_BUSINESS_ID",'
+        b'"MAILING_ADDRESS","SUPPLEMENTAL_ADDRESS","CITY_NAME","STATE_CODE","STATE_NAME",'
+        b'"POSTAL_CODE","COUNTRY_NAME"\n'
+        b'"110000000001","NPDES","OH0011223","ICIS-NPDES NON-MAJOR","OWNER","","",'
+        b'"ACME HOLDINGS","PRIVATE","","","","","","","","","","","","","","",""\n'
+    ),
+    "NATIONAL_PROGRAM_FILE.CSV": (
+        b'"PGM_SYS_ACRNM","PGM_SYS_ID","REGISTRY_ID","PRIMARY_NAME","LOCATION_ADDRESS",'
+        b'"CITY_NAME","STATE_CODE","STATE_NAME","POSTAL_CODE","EPA_REGION_CODE",'
+        b'"LAST_REPORTED_DATE","CREATE_DATE","UPDATE_DATE","REFRESH_DATE","SOURCE_OF_DATA"\n'
+        b'"SFDW","OH1234567","110000000001","ACME WORKS","1 MAIN ST","NILES","OH","OHIO",'
+        b'"44446","5","12-JUN-08","15-MAY-08","04-MAR-14","14-JUN-08","SDWIS"\n'
+        b'"NPDES","OH0011223","110000000001","ACME WORKS","1 MAIN ST","NILES","OH","OHIO",'
+        b'"44446","5","","","","","ICIS"\n'
+    ),
+}
+
+
+@pytest.fixture(scope="session")
+def mini_zip(tmp_path_factory) -> Path:
+    path = tmp_path_factory.mktemp("frs") / "national_combined.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("NATIONAL_FACILITY_FILE.CSV", FACILITY)
+        zf.writestr("NATIONAL_ENVIRONMENTAL_INTEREST_FILE.CSV", ENV_INTEREST)
+        zf.writestr("NATIONAL_MAILING_ADDRESS_FILE.CSV", MAILING)
+        zf.writestr("NATIONAL_ALTERNATIVE_NAME_FILE.CSV", ALT_NAME)
+        for name, body in SIMPLE.items():
+            zf.writestr(name, body)
+    return path
+
+
+@pytest.fixture(scope="session")
+def built(mini_zip, tmp_path_factory):
+    from j2d.frs.pipeline import run_all
+
+    work = tmp_path_factory.mktemp("work")
+    return run_all(mini_zip, work)

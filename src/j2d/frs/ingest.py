@@ -1,0 +1,271 @@
+"""Stream the FRS national combined zip straight into Parquet.
+
+The archive is ~1.2 GB compressed and ~10 GB expanded. Nothing here ever
+materialises that 10 GB on disk: each CSV member is read as a stream of Arrow
+record batches straight out of the zip and written incrementally to Parquet.
+Peak memory is one batch, not one table.
+"""
+
+from __future__ import annotations
+
+import io
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.csv as pcsv
+import pyarrow.parquet as pq
+
+from .schema import PII_COLUMNS, PII_TABLES, Table, member_to_table
+
+#: 64 MiB CSV read blocks: large enough to amortise per-batch overhead, small
+#: enough that peak RSS stays well under a GB per worker.
+BLOCK_SIZE = 1 << 26
+
+#: Parquet row group size. Chosen so DuckDB can skip whole groups on the
+#: predicates that matter here (STATE_CODE, PGM_SYS_ACRNM).
+ROW_GROUP_SIZE = 256_000
+
+
+@dataclass
+class IngestResult:
+    table: str
+    member: str
+    rows: int
+    columns: int
+    path: Path
+    bytes_out: int
+    seconds: float
+    encoding_fallback: bool = False
+    control_bytes_removed: int = 0
+
+    @property
+    def rows_per_second(self) -> float:
+        return self.rows / self.seconds if self.seconds else 0.0
+
+
+#: C0 control bytes deleted from the stream. Tab, LF and CR are kept because
+#: they are structural. Everything else is corruption: EPA's extract carries
+#: runs of NUL inside quoted address fields (216 bytes in the mailing-address
+#: file, 1,755 in the organization file), plus a scattering of other control
+#: characters in free-text name fields.
+#:
+#: Deleting them bytewise is safe on UTF-8: every byte of a multi-byte sequence
+#: has the high bit set, so no control byte can appear inside one.
+_CONTROL_BYTES = bytes(b for b in range(0x20) if b not in (0x09, 0x0A, 0x0D))
+
+
+class _TextSanitiser(io.RawIOBase):
+    """Wrap a binary stream, removing control bytes and repairing bad UTF-8.
+
+    Two distinct problems, both present in the real archive:
+
+    1. **Embedded NULs.** Arrow's CSV parser treats a NUL as a field terminator
+       and silently emits a short row, which then fails the column-count check
+       and aborts the whole 2 GB table. Python's own ``csv`` module reads the
+       same row correctly at 14 fields, so this is a parser limitation rather
+       than malformed CSV. Deleting the NULs keeps the row and costs only the
+       junk that was in the field.
+
+    2. **Invalid UTF-8.** Arrow rejects an entire batch on the first bad byte.
+       Decoding with ``errors="replace"`` keeps the row.
+
+    Chunks are re-aligned so a multi-byte character split across two reads
+    survives intact.
+    """
+
+    def __init__(self, raw: io.BufferedIOBase) -> None:
+        self._raw = raw
+        self._tail = b""
+        self._pending = b""
+        self.control_bytes_removed = 0
+        self.utf8_repaired = False
+
+    def readable(self) -> bool:  # pragma: no cover - trivial
+        return True
+
+    def readinto(self, buf) -> int:
+        want = len(buf)
+        if self._pending:
+            out = self._pending[:want]
+            self._pending = self._pending[want:]
+            buf[: len(out)] = out
+            return len(out)
+
+        chunk = self._raw.read(want)
+        if not chunk and not self._tail:
+            return 0
+        data = self._tail + chunk
+        self._tail = b""
+
+        if chunk:
+            # Hold back a trailing partial multi-byte sequence for the next read.
+            for back in range(1, min(4, len(data)) + 1):
+                if data[-back] & 0xC0 != 0x80:
+                    if data[-back] & 0x80:
+                        self._tail = data[-back:]
+                        data = data[:-back]
+                    break
+
+        stripped = data.translate(None, _CONTROL_BYTES)
+        if len(stripped) != len(data):
+            self.control_bytes_removed += len(data) - len(stripped)
+        data = stripped
+
+        try:
+            out = data.decode("utf-8").encode("utf-8")
+        except UnicodeDecodeError:
+            self.utf8_repaired = True
+            out = data.decode("utf-8", errors="replace").encode("utf-8")
+
+        if len(out) > want:
+            # Replacement characters can grow the buffer; queue the overflow.
+            self._pending = out[want:]
+            out = out[:want]
+        buf[: len(out)] = out
+        return len(out)
+
+
+def _all_string_types(names: list[str]) -> dict[str, pa.DataType]:
+    return {name: pa.string() for name in names}
+
+
+def read_header(zf: zipfile.ZipFile, member: str) -> list[str]:
+    """Return the column names of a zip member without decompressing it all."""
+    with zf.open(member) as fh:
+        buf = fh.read(1 << 20)
+    text = buf.decode("utf-8", errors="replace").lstrip("﻿")
+    first = text.split("\n", 1)[0].rstrip("\r")
+    tbl = pcsv.read_csv(io.BytesIO((first + "\n").encode("utf-8")))
+    return tbl.column_names
+
+
+def ingest_table(
+    zip_path: Path,
+    table: Table,
+    out_dir: Path,
+    *,
+    force: bool = False,
+    drop_pii: bool = False,
+) -> IngestResult:
+    """Convert one CSV member of the archive to Parquet.
+
+    Returns an :class:`IngestResult`; raises nothing on an already-present
+    output unless ``force`` is set, in which case it is rewritten.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{table.name}.parquet"
+    if out_path.exists() and not force:
+        md = pq.read_metadata(out_path)
+        return IngestResult(
+            table=table.name,
+            member=table.member,
+            rows=md.num_rows,
+            columns=md.num_columns,
+            path=out_path,
+            bytes_out=out_path.stat().st_size,
+            seconds=0.0,
+        )
+
+    started = time.time()
+    tmp_path = out_path.with_suffix(".parquet.tmp")
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = read_header(zf, table.member)
+        drop: set[str] = set()
+        if drop_pii:
+            if table.name in PII_TABLES:
+                drop.update(names)
+            drop.update(c for c in PII_COLUMNS.get(table.name, ()) if c in names)
+
+        with zf.open(table.member) as raw:
+            sanitiser = _TextSanitiser(raw)
+            stream = io.BufferedReader(sanitiser, buffer_size=BLOCK_SIZE)
+            reader = pcsv.open_csv(
+                stream,
+                read_options=pcsv.ReadOptions(block_size=BLOCK_SIZE),
+                parse_options=pcsv.ParseOptions(newlines_in_values=True),
+                convert_options=pcsv.ConvertOptions(
+                    column_types=_all_string_types(names),
+                    strings_can_be_null=True,
+                    include_columns=[n for n in names if n not in drop] or None,
+                ),
+            )
+            writer: pq.ParquetWriter | None = None
+            rows = 0
+            ncols = 0
+            try:
+                for batch in reader:
+                    if writer is None:
+                        writer = pq.ParquetWriter(
+                            tmp_path,
+                            batch.schema,
+                            compression="zstd",
+                            compression_level=3,
+                            use_dictionary=True,
+                        )
+                        ncols = batch.num_columns
+                    writer.write_batch(batch, row_group_size=ROW_GROUP_SIZE)
+                    rows += batch.num_rows
+            finally:
+                if writer is not None:
+                    writer.close()
+            repaired = sanitiser.utf8_repaired
+            removed = sanitiser.control_bytes_removed
+
+    if rows == 0 and not tmp_path.exists():
+        raise RuntimeError(f"{table.member}: produced no rows")
+    tmp_path.replace(out_path)
+
+    return IngestResult(
+        table=table.name,
+        member=table.member,
+        rows=rows,
+        columns=ncols,
+        path=out_path,
+        bytes_out=out_path.stat().st_size,
+        seconds=time.time() - started,
+        encoding_fallback=repaired,
+        control_bytes_removed=removed,
+    )
+
+
+def ingest_all(
+    zip_path: Path,
+    out_dir: Path,
+    *,
+    force: bool = False,
+    drop_pii: bool = False,
+    only: list[str] | None = None,
+    progress=None,
+) -> list[IngestResult]:
+    """Convert every CSV member of the archive to Parquet, smallest first."""
+    with zipfile.ZipFile(zip_path) as zf:
+        sizes = {i.filename: i.file_size for i in zf.infolist()}
+    lookup = member_to_table()
+    wanted = [t for t in lookup.values() if only is None or t.name in only]
+    wanted.sort(key=lambda t: sizes.get(t.member, 0))
+
+    results = []
+    for table in wanted:
+        if progress:
+            progress(f"ingest {table.name:<24} ({sizes.get(table.member, 0) / 1e6:,.0f} MB csv)")
+        res = ingest_table(zip_path, table, out_dir, force=force, drop_pii=drop_pii)
+        if progress:
+            progress(
+                f"  -> {res.rows:>10,} rows  {res.bytes_out / 1e6:>7,.0f} MB parquet"
+                f"  {res.seconds:>6.1f}s"
+                + ("  [utf8 repaired]" if res.encoding_fallback else "")
+                + (f"  [{res.control_bytes_removed} control bytes removed]" if res.control_bytes_removed else "")
+            )
+        results.append(res)
+    return results
+
+
+def missing_members(zip_path: Path) -> list[str]:
+    """Zip members the registry does not know about (schema drift check)."""
+    with zipfile.ZipFile(zip_path) as zf:
+        members = {i.filename for i in zf.infolist() if i.filename.upper().endswith(".CSV")}
+    return sorted(members - set(member_to_table()))
