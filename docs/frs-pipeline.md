@@ -150,6 +150,11 @@ SELECT PGM_SYS_ACRNM, PGM_SYS_ID, source_tables
 FROM crosswalk WHERE REGISTRY_ID = '110000491735';
 ```
 
+`source_table_count` is only comparable between builds that scanned the same
+sources, so the build records them in `crosswalk_sources`. A `--no-pii` run
+excludes `contact` and shifts the count on 2.4 million links while adding and
+removing exactly zero links.
+
 ## Drinking water
 
 Drinking-water systems are held under **`SFDW`** (Safe Drinking Water), not
@@ -269,10 +274,20 @@ from `organization`:
 j2d frs ingest --no-pii
 ```
 
-It refuses to "filter" an all-personal table rather than quietly writing a
-column-less one, because an empty column list is falsy and would otherwise be
-handed to Arrow as `None`, meaning *all columns* — writing the full table with
-the personal data intact. There is a regression test for exactly that.
+Two behaviours worth knowing, both of which were bugs first:
+
+- It **refuses to "filter"** an all-personal table rather than quietly writing a
+  column-less one. An empty column list is falsy, so `[] or None` was handed to
+  Arrow as `None` — meaning *all columns* — and the table was written in full
+  with the personal data intact.
+- It **deletes an existing `contact.parquet`** rather than merely skipping the
+  table, and it ignores a cached Parquet that still holds columns `--no-pii`
+  drops. Otherwise a full ingest followed by `--no-pii` printed "skip contact",
+  exited 0, and left the file on disk for `frs build` to publish a view over.
+
+Both have regression tests. The second only reproduces over a pre-existing work
+directory, which is exactly the case an operator hits when told to strip PII
+after the fact.
 
 ## Scale
 
@@ -281,7 +296,7 @@ Measured on 4 cores / 15 GB RAM:
 | Stage | Time | Output |
 |---|---|---|
 | ingest (10 GB CSV → Parquet) | 3.3 min | 1.1 GB |
-| build views + crosswalk | 1.7 min | 128 MB DuckDB |
+| build views + crosswalk + water_system | ~2 min | ~150 MB DuckDB |
 | QA (full scans) | ~2 min | — |
 
 Peak memory is one 64 MiB batch per table, not one table. The 10 GB expansion is

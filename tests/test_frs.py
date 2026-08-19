@@ -375,6 +375,18 @@ def test_coord_rejects_zero_and_out_of_range(con):
 # --------------------------------------------------------------------------
 
 
+def test_run_all_honours_an_explicit_db_path(mini_zip, tmp_path):
+    """`frs all` accepted --db and wrote work/frs.duckdb anyway."""
+    from j2d.frs.pipeline import run_all
+
+    work = tmp_path / "w"
+    custom = tmp_path / "custom.duckdb"
+    info = run_all(mini_zip, work, db_path=custom)
+    assert info["db_path"] == custom
+    assert custom.exists()
+    assert not (work / "frs.duckdb").exists()
+
+
 def test_pipeline_ingests_every_table(built):
     names = {r.table for r in built["ingest"]}
     assert names == set(TABLES)
@@ -488,6 +500,41 @@ def test_no_pii_strips_pii_columns_from_mixed_tables(mini_zip, tmp_path):
     assert "ORG_NAME" in cols, "non-PII columns must survive"
 
 
+def test_no_pii_removes_an_already_ingested_contact_parquet(mini_zip, tmp_path):
+    """Re-running with --no-pii over a full ingest must delete the PII file.
+
+    Regression: ingest_all removed contact from its *work list* rather than
+    removing contact.parquet, so a full ingest followed by --no-pii printed
+    "skip contact" and exited 0 while the file sat there, and `frs build`
+    published a view over it.
+    """
+    from j2d.frs.ingest import ingest_all
+
+    pq_dir = tmp_path / "pq"
+    ingest_all(mini_zip, pq_dir)
+    assert (pq_dir / "contact.parquet").exists()
+
+    ingest_all(mini_zip, pq_dir, drop_pii=True)
+    assert not (pq_dir / "contact.parquet").exists()
+
+
+def test_no_pii_rewrites_a_cached_mixed_table(mini_zip, tmp_path):
+    """The cache must not satisfy a --no-pii request with a PII-bearing file."""
+    import duckdb
+
+    from j2d.frs.ingest import ingest_all
+    from j2d.frs.schema import PII_COLUMNS
+
+    pq_dir = tmp_path / "pq"
+    ingest_all(mini_zip, pq_dir, only=["organization"])
+    ingest_all(mini_zip, pq_dir, only=["organization"], drop_pii=True)
+
+    con = duckdb.connect()
+    path = (pq_dir / "organization.parquet").as_posix()
+    cols = {d[0] for d in con.execute(f"SELECT * FROM read_parquet('{path}') LIMIT 0").description}
+    assert not cols & set(PII_COLUMNS["organization"]), "cache must not serve stale PII"
+
+
 def test_ingest_table_refuses_to_filter_an_all_pii_table(mini_zip, tmp_path):
     import pytest as _pytest
 
@@ -542,6 +589,94 @@ def test_water_system_splits_pwsid_from_plant_id(built):
         assert by_pwsid["OH1234567"][1] is None          # a system, no plant id
         assert by_pwsid["AR9876543"][1] == "4242"        # a plant within a system
         assert by_pwsid["OH1234567"][3] == "OH"
+    finally:
+        con.close()
+
+
+def test_explode_does_not_truncate_an_id_containing_a_comma(built):
+    """The separator is comma-SPACE; splitting on a bare comma corrupts ids.
+
+    Regression: 'NCDB:D06#MM-06-98-0736,T' split into a truncated head that
+    fabricated a link no source asserts, plus a tail dropped for having no colon.
+    """
+    con = db.connect(built["db_path"], read_only=True)
+    try:
+        got = con.execute(
+            "SELECT PGM_SYS_ID FROM crosswalk "
+            "WHERE REGISTRY_ID='110000000001' AND PGM_SYS_ACRNM='NCDB'"
+        ).fetchall()
+        assert got == [("D06#MM-06-98-0736,T",)]
+    finally:
+        con.close()
+
+
+def test_crosswalk_records_which_tables_it_scanned(built):
+    """source_table_count means nothing without the denominator.
+
+    A --no-pii build excludes contact and shifts the count on millions of links
+    while changing no link at all.
+    """
+    con = db.connect(built["db_path"], read_only=True)
+    try:
+        sources = [r[0] for r in con.execute(
+            "SELECT source_table FROM crosswalk_sources ORDER BY scan_order"
+        ).fetchall()]
+        assert "facility_acrnms" in sources
+        assert "contact" in sources
+        assert len(sources) == len(set(sources))
+    finally:
+        con.close()
+
+
+def test_water_system_keeps_the_full_suffix_of_a_three_token_id(built):
+    """'MP0000211 0000211TP UV' - the UV is a treatment technology, not noise."""
+    con = db.connect(built["db_path"], read_only=True)
+    try:
+        row = con.execute(
+            "SELECT PWSID, SYSTEM_FACILITY_ID, SFDW_ID FROM water_system "
+            "WHERE SFDW_ID LIKE 'MP0000211%'"
+        ).fetchone()
+        assert row == ("MP0000211", "0000211TP UV", "MP0000211 0000211TP UV")
+    finally:
+        con.close()
+
+
+def test_water_system_nulls_a_pwsid_state_that_is_not_a_state(built):
+    """'063503111' has no USPS prefix; '06' must not be presented as a state."""
+    con = db.connect(built["db_path"], read_only=True)
+    try:
+        assert con.execute(
+            "SELECT PWSID_STATE FROM water_system WHERE PWSID='063503111'"
+        ).fetchone()[0] is None
+        assert con.execute(
+            "SELECT PWSID_STATE FROM water_system WHERE PWSID='OH1234567'"
+        ).fetchone()[0] == "OH"
+    finally:
+        con.close()
+
+
+def test_water_system_includes_links_absent_from_environmental_interest(built):
+    """8,150 real SFDW links are asserted only by other tables."""
+    con = db.connect(built["db_path"], read_only=True)
+    try:
+        row = con.execute(
+            "SELECT PWSID, INTEREST_TYPE FROM water_system WHERE PWSID='OH7654321'"
+        ).fetchone()
+        assert row is not None, "a crosswalk-only SFDW link must still appear"
+        assert row[1] is None, "with null interest fields rather than not at all"
+    finally:
+        con.close()
+
+
+def test_water_system_is_materialised_not_a_view(built):
+    """The docstring says materialised; a view re-joined 5.3M rows per query."""
+    con = db.connect(built["db_path"], read_only=True)
+    try:
+        kind = con.execute(
+            "SELECT table_type FROM information_schema.tables "
+            "WHERE table_name = 'water_system' AND table_catalog = current_database()"
+        ).fetchone()[0]
+        assert kind == "BASE TABLE"
     finally:
         con.close()
 

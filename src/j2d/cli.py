@@ -53,6 +53,7 @@ def cmd_all(args) -> int:
     info = run_all(
         args.zip,
         args.work,
+        db_path=_db_path(args),
         force=args.force,
         drop_pii=args.no_pii,
         only=args.only,

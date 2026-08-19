@@ -15,9 +15,11 @@ Layering:
     duplicate to ``NAME_1`` and leave every downstream reference resolving to
     the wrong column.
 
-``crosswalk`` / ``water_system``
-    Materialised, because they are joins that would otherwise be recomputed on
-    every query. See :mod:`j2d.frs.crosswalk`.
+``crosswalk`` / ``water_system`` / ``crosswalk_sources``
+    Materialised tables, because they are joins that would otherwise be
+    recomputed on every query. ``crosswalk_sources`` records which tables the
+    build scanned, without which ``source_table_count`` is not comparable
+    between builds. See :mod:`j2d.frs.crosswalk`.
 """
 
 from __future__ import annotations
@@ -57,9 +59,27 @@ def quote_literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def connect(db_path: Path, *, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+def connect(
+    db_path: Path,
+    *,
+    read_only: bool = False,
+    memory_limit_gb: float | None = None,
+) -> duckdb.DuckDBPyConnection:
+    """Open the database.
+
+    DuckDB's defaults are left alone deliberately. For a file-backed database it
+    spills into the database file itself, which is what the crosswalk build over
+    47M rows relies on; pointing ``temp_directory`` elsewhere made it spill to a
+    separate file and exhaust the disk instead.
+
+    ``memory_limit_gb`` is an escape hatch for a machine smaller than this was
+    developed on, not something to set by default.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(str(db_path), read_only=read_only)
+    con = duckdb.connect(str(db_path), read_only=read_only)
+    if memory_limit_gb is not None:
+        con.execute(f"SET memory_limit = '{float(memory_limit_gb)}GB'")
+    return con
 
 
 def _column_expr(table: Table, col: str) -> str:

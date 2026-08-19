@@ -37,13 +37,14 @@ def run_all(
     zip_path: Path,
     work_dir: Path,
     *,
+    db_path: Path | None = None,
     force: bool = False,
     drop_pii: bool = False,
     only: list[str] | None = None,
     progress=None,
 ) -> dict:
     parquet_dir = work_dir / "parquet"
-    db_path = work_dir / "frs.duckdb"
+    db_path = db_path or work_dir / "frs.duckdb"
     results: list[IngestResult] = ingest_all(
         zip_path, parquet_dir, force=force, drop_pii=drop_pii, only=only, progress=progress
     )

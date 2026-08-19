@@ -215,6 +215,11 @@ def ingest_table(
         )
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{table.name}.parquet"
+    if out_path.exists() and not force and drop_pii and _has_pii(out_path, table):
+        # The cache predates the --no-pii request. Returning it would report a
+        # successful privacy-filtered ingest over a file that still holds the
+        # personal columns.
+        force = True
     if out_path.exists() and not force:
         md = pq.read_metadata(out_path)
         return IngestResult(
@@ -296,6 +301,14 @@ def ingest_table(
     )
 
 
+def _has_pii(path: Path, table: Table) -> bool:
+    """True if an already-written Parquet still carries columns --no-pii drops."""
+    names = set(pq.read_schema(path).names)
+    if table.name in PII_TABLES:
+        return bool(names)
+    return bool(names & set(PII_COLUMNS.get(table.name, ())))
+
+
 def ingest_all(
     zip_path: Path,
     out_dir: Path,
@@ -311,10 +324,20 @@ def ingest_all(
     lookup = member_to_table()
     wanted = [t for t in lookup.values() if only is None or t.name in only]
     if drop_pii:
-        excluded = [t.name for t in wanted if t.name in PII_TABLES]
-        if excluded and progress:
-            for name in excluded:
-                progress(f"skip   {name:<24} (entirely personal data; --no-pii)")
+        excluded = [t for t in wanted if t.name in PII_TABLES]
+        for table in excluded:
+            # Removing the table from the work list is not enough: a previous
+            # full ingest would leave its Parquet in place, and `frs build`
+            # would publish a view over it. Delete the file.
+            stale = out_dir / f"{table.name}.parquet"
+            removed = stale.exists()
+            if removed:
+                stale.unlink()
+            if progress:
+                progress(
+                    f"skip   {table.name:<24} (entirely personal data; --no-pii)"
+                    + ("  [removed existing parquet]" if removed else "")
+                )
         wanted = [t for t in wanted if t.name not in PII_TABLES]
     wanted.sort(key=lambda t: sizes.get(t.member, 0))
 
