@@ -1,0 +1,9 @@
+id,name,sector,derived,fragmentation,deadline,incumbent,total,crowding,deadline_date,primary_buyer
+0,Transmission,energy,,,,,,"",,"reference project — spec not in this repo"
+1,State rate case tracker,energy,5,5,2,5,17,low,,Utility regulatory & strategy teams
+2,Interconnection queue outcomes,energy,4,3,3,3,13,severe,,Data center site selectors
+3,Water treatment buying signal,water,5,5,5,2,17,low,2027-11-01,Membrane & media vendors
+4,DOT bid tabulation benchmark,civil,5,5,2,3,15,low,,Heavy civil estimating departments
+5,Insurance rate filings (SERFF),insurance,5,5,3,4,17,moderate,,Mortgage & real estate underwriters
+6,Municipal continuing disclosure (EMMA),munis,4,3,2,4,13,moderate,,Muni asset managers
+7,Hospital & payer price transparency,healthcare,4,2,1,4,11,severe,,Employers & benefit consultants
