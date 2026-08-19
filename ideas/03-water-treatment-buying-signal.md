@@ -66,6 +66,41 @@ format each state chose.
   Rolling detections up to a treatment decision requires knowing something about system
   configuration that no dataset states directly.
 
+## What the FRS spine actually gives you
+
+Built and measured — see `docs/frs-pipeline.md` and `src/j2d/frs/`. EPA's Facility
+Registry Service is the closest thing to the missing join key, and it is now
+loaded: 47.6M rows, 5.3M facilities, a 7.6M-link cross-program crosswalk.
+
+What it solves:
+
+- **380,410 distinct PWSIDs**, of which **131,598** are community or
+  non-transient non-community systems — the population actually subject to the
+  PFAS MCLs and the LCRI. That is the denominator for the whole product, and it
+  is now a table rather than an estimate.
+- **235,288 water-treatment-plant records** *inside* those systems. Plant-level
+  granularity is what a vendor sizes a proposal against, and it is finer than
+  anything SDWIS exposes conveniently.
+- A **crosswalk to every other program** at the same facility, including roughly
+  forty-five state systems. This is the fragmentation asset: NJ-NJEMS,
+  CA-ENVIROVIEW, MN-TEMPO, TX-TCEQ ACR and their peers are exactly the
+  state-by-state surface the thesis says is a moat.
+
+What it does **not** solve, and these matter:
+
+- **Drinking water is `SFDW`, not `SDWIS`.** The acronym everyone searches for is
+  not the one in the data. Trivial once known, silently empty until then.
+- **The crosswalk is to a facility, not to a borrower.** SRF Intended Use Plans
+  name a borrower in prose. FRS gets you PWSID ↔ facility ↔ other program IDs; it
+  does not get you "City of ——— Water Treatment Plant Improvements, $4.2M" ↔
+  PWSID. That entity resolution is still the hard, unsolved, valuable part.
+- **No coordinates.** All 5,319,139 facility rows have empty latitude and
+  longitude in this extract. Geospatial targeting needs a separate EPA download.
+
+Net: FRS removes maybe a third of the entity-resolution problem — the part that
+joins EPA's own systems to each other. The SRF-to-PWSID join, which is where the
+money signal lives, is untouched by it.
+
 ## Why now
 
 This is the strongest timing in the repo, and the dates are worth stating exactly

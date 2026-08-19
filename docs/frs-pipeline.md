@@ -142,8 +142,16 @@ In this extract: 608,487 SFDW interests over 392,724 facilities, of which
 | Non-transient non-community water system | 41,731 |
 
 Community and non-transient non-community systems are the population subject to
-the PFAS MCLs and the LCRI, which makes those 131,602 rows the addressable
-universe for the water dataset in `ideas/03-water-treatment-buying-signal.md`.
+the PFAS MCLs and the LCRI: 131,602 interest rows resolving to **131,598 distinct
+PWSIDs**, out of 380,410 distinct PWSIDs in the extract overall. That is the
+addressable universe for the water dataset in
+`ideas/03-water-treatment-buying-signal.md`.
+
+Two caveats on the ID parsing, both tiny but real: 2 of the 608,487 SFDW ids
+contain more than one space, so their plant id is truncated by the split; and 2
+program ids elsewhere in the extract contain a comma, which the
+`facility.PGM_SYS_ACRNMS` explode mis-splits. No id anywhere contains a colon, so
+the acronym split is safe.
 
 ## Known defects in the source data
 
