@@ -11,19 +11,31 @@ is left to :mod:`j2d.frs.qa`, which reports rather than deletes.
 
 from __future__ import annotations
 
-#: How far into the future a parsed date may fall before we conclude the
-#: two-digit year belongs to the previous century.
+#: The two-digit years that C ``strptime`` resolves to a century FRS never used.
 #:
-#: FRS dates are Oracle ``DD-MON-YY``. C ``strptime`` maps 00-68 to 2000-2068
-#: and 69-99 to 1969-1999. That is right for creation dates but wrong for the
-#: handful of 1950s and 1960s permit dates, which land in 2050-2068.
+#: FRS dates are Oracle ``DD-MON-YY``. C ``strptime`` maps ``00``-``68`` to
+#: 2000-2068 and ``69``-``99`` to 1969-1999. The second half is right. The first
+#: is right for recent dates and wrong for mid-century ones: a 1960 permit date
+#: written ``01-JAN-60`` comes back as 2060.
 #:
-#: Permit *expiration* dates legitimately sit in the future, so we cannot simply
-#: reject future dates. The window below keeps genuine expirations (a 2035
-#: permit stays 2035) while pulling implausible ones back a century. Every
-#: adjustment is counted by ``qa.check_date_century_adjustments`` so the rule
-#: never operates silently.
-FUTURE_YEARS_ALLOWED = 25
+#: Only years landing in **2050-2068** are ambiguous. Below 2050 the modern
+#: reading is overwhelmingly more likely (a ``25`` is 2025, not 1925, in a
+#: registry that did not exist then), and 2069+ is unreachable from a two-digit
+#: year. So exactly that band is pulled back a century.
+#:
+#: The band is a fixed constant rather than an offset from ``current_date`` on
+#: purpose. An earlier version used "more than 25 years in the future", which
+#: had two faults: it left ``50`` and ``51`` unadjusted (11,255 rows in this
+#: extract kept a 2050/2051 date that is really 1950/1951, while sibling rows
+#: dated 1952-1968 were corrected), and it made the output depend on the day the
+#: build ran, so the same input Parquet yielded different dates over time.
+#:
+#: The cost is that a genuine permit expiring in 2050-2068 would be dragged to
+#: the 1950s. This extract contains no such row — zero permit-expiration dates
+#: fall in the band — and ``qa.check_dates`` counts every adjustment, so the
+#: trade is visible rather than assumed.
+AMBIGUOUS_CENTURY_FIRST_YEAR = 2050
+AMBIGUOUS_CENTURY_LAST_YEAR = 2068
 
 #: Country spellings observed in the extract, mapped to ISO-3166 alpha-2.
 COUNTRY_MAP = {
@@ -64,20 +76,35 @@ def sql_date(col: str) -> str:
     """SQL expression parsing an Oracle ``DD-MON-YY`` column to ``DATE``.
 
     Unparseable values become ``NULL`` rather than raising, so one bad string
-    cannot abort a scan over 8 million rows. :mod:`j2d.frs.qa` counts them.
+    cannot abort a scan over 8 million rows. :func:`j2d.frs.qa.check_dates`
+    counts both the failures and the century adjustments.
+
+    The result depends only on the input, never on when the build ran.
     """
     parsed = f"try_strptime(nullif(trim({col}), ''), '%d-%b-%y')"
     return (
         f"CASE WHEN {parsed} IS NULL THEN NULL "
-        f"WHEN {parsed} > current_date + INTERVAL {FUTURE_YEARS_ALLOWED} YEAR "
+        f"WHEN year({parsed}) BETWEEN {AMBIGUOUS_CENTURY_FIRST_YEAR} "
+        f"AND {AMBIGUOUS_CENTURY_LAST_YEAR} "
         f"THEN ({parsed} - INTERVAL 100 YEAR)::DATE "
         f"ELSE {parsed}::DATE END"
     )
 
 
 def sql_text(col: str) -> str:
-    """Trim, collapse internal whitespace runs, and empty-to-NULL."""
-    return f"nullif(regexp_replace(trim({col}), '\\s+', ' ', 'g'), '')"
+    """Collapse whitespace runs, trim the edges, and empty-to-NULL.
+
+    Order matters. DuckDB's one-argument ``trim`` strips ASCII spaces only, so
+    trimming first would leave a leading tab in place, and the subsequent
+    ``\\s+`` collapse would turn it into a leading *space* that nothing removes.
+    A field of nothing but a tab would become ``' '`` rather than ``NULL``,
+    defeating the empty-to-NULL guard entirely. Collapsing first normalises
+    every whitespace character to a space, and the trim then catches all of them.
+
+    This matters because the ingest deliberately preserves tab, CR and LF —
+    they are structural in CSV — so they do reach this expression.
+    """
+    return f"nullif(trim(regexp_replace({col}, '\\s+', ' ', 'g')), '')"
 
 
 def sql_upper(col: str) -> str:
@@ -144,7 +171,12 @@ def sql_county_fips(fips_col: str, state_col: str) -> str:
     )
 
 
-def sql_coord(col: str) -> str:
-    """Parse a coordinate to DOUBLE, nulling values outside a sane range."""
+def sql_coord(col: str, *, lo: float = -180.0, hi: float = 180.0) -> str:
+    """Parse a coordinate to DOUBLE, nulling values outside ``lo``..``hi``.
+
+    Latitude and longitude have different valid ranges, so the bounds are a
+    parameter rather than a shared constant: passing ``180`` for a latitude
+    would accept a transposed lat/long pair as valid.
+    """
     v = f"try_cast(nullif(trim({col}), '') AS DOUBLE)"
-    return f"CASE WHEN {v} BETWEEN -180 AND 180 AND {v} <> 0 THEN {v} ELSE NULL END"
+    return f"CASE WHEN {v} BETWEEN {lo} AND {hi} AND {v} <> 0 THEN {v} ELSE NULL END"

@@ -14,7 +14,13 @@ import duckdb
 import pytest
 
 from j2d.frs import crosswalk, db, normalize as nz, qa
-from j2d.frs.ingest import BLOCK_SIZE, _TextSanitiser, missing_members, read_header
+from j2d.frs.ingest import (
+    BLOCK_SIZE,
+    _CONTROL_BYTES,
+    _TextSanitiser,
+    missing_members,
+    read_header,
+)
 from j2d.frs.schema import TABLES, member_to_table
 
 
@@ -87,6 +93,61 @@ def test_sanitiser_handles_replacement_growth_across_reads():
     assert out.decode("utf-8") == "�" * 50
 
 
+def test_utf8_repaired_counts_only_our_own_replacements():
+    """EPA already ships 1,228 encoded U+FFFD; those are not our repairs.
+
+    Regression: detecting repairs by looking for U+FFFD in the *output* flagged
+    the source's own mojibake, so the diagnostic fired on files nothing had been
+    done to.
+    """
+    genuine, s1 = _through(b"90\xb0 works")
+    assert s1.utf8_repaired is True
+    assert s1.invalid_bytes_replaced == 1
+
+    preexisting, s2 = _through("already \ufffd mojibake".encode("utf-8"))
+    assert s2.utf8_repaired is False
+    assert s2.invalid_bytes_replaced == 0
+    assert preexisting == "already \ufffd mojibake".encode("utf-8")
+
+
+def test_sanitiser_never_reports_eof_while_data_remains():
+    """A read yielding only a partial character must not look like EOF.
+
+    Regression: the old hand-rolled holdback could consume the whole chunk,
+    leaving nothing to return. RawIOBase reads 0 as EOF, so BufferedReader
+    stopped and the held-back bytes were lost.
+    """
+    s = _TextSanitiser(io.BytesIO(b"\xf0\x9f\x98\x80"))
+    buf = bytearray(1 << 20)
+    assert s.readinto(buf) == 4
+    assert bytes(buf[:4]) == b"\xf0\x9f\x98\x80"
+
+
+@pytest.mark.parametrize("run", [1755, 20_000])
+def test_long_control_run_does_not_truncate_the_stream(run):
+    """A control-byte run longer than one read must not end the stream.
+
+    Regression: translate() could empty a non-empty chunk, and returning 0
+    then read as EOF, discarding the rest of the member.
+    """
+    data = b'"a","' + b"\x00" * run + b'","c"\n"d","e","f"\n'
+    out, s = _through(data, chunk=8192)
+    assert out == b'"a","","c"\n"d","e","f"\n'
+    assert s.control_bytes_removed == run
+
+
+@pytest.mark.parametrize("bufsize", [64, 256, 1024, 65536])
+def test_repaired_output_does_not_depend_on_block_size(bufsize):
+    """Same bytes in, same bytes out, wherever the read boundaries fall."""
+    import random
+
+    random.seed(7)
+    bad = bytes(random.choice([0x41, 0xFF, 0xC3, 0x28, 0xE4, 0xB8, 0xAD]) for _ in range(4000))
+    reference = bad.translate(None, _CONTROL_BYTES).decode("utf-8", "replace").encode("utf-8")
+    out, _ = _through(bad, chunk=bufsize)
+    assert out == reference
+
+
 # --------------------------------------------------------------------------
 # schema registry
 # --------------------------------------------------------------------------
@@ -141,6 +202,53 @@ def test_date_century_pivot(con, raw, expected_year):
 def test_bad_dates_become_null_not_an_error(con, raw):
     got = con.execute(f"SELECT {nz.sql_date(chr(39) + raw + chr(39))}").fetchone()[0]
     assert got is None
+
+
+def test_date_band_is_continuous_across_the_pivot(con):
+    """Every two-digit year must resolve sensibly - no gap at the boundary.
+
+    Regression: a "more than 25 years in the future" rule left 50 and 51 in
+    2050/2051 while 52-68 were corrected, splitting adjacent years in the same
+    column across two centuries.
+    """
+    got = {}
+    for yy in range(0, 100):
+        expr = nz.sql_date(chr(39) + f"01-JAN-{yy:02d}" + chr(39))
+        got[yy] = con.execute(f"SELECT {expr}").fetchone()[0].year
+    for yy in range(0, 50):
+        assert got[yy] == 2000 + yy, f"{yy:02d} should be modern"
+    for yy in range(50, 100):
+        assert got[yy] == 1900 + yy, f"{yy:02d} should be last century"
+
+
+def test_date_parsing_is_independent_of_the_wall_clock(con):
+    """The expression must not reference current_date.
+
+    Regression: the pivot was an offset from today, so the same input Parquet
+    produced different DATE values depending on when the build ran.
+    """
+    assert "current_date" not in nz.sql_date('"X"').lower()
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("\tACME\t", "ACME"),
+        ("\n ACME \n", "ACME"),
+        ("\t", None),
+        ("  \t  ", None),
+        ("\r\n", None),
+        ("A\tB", "A B"),
+    ],
+)
+def test_text_handles_tabs_and_newlines(con, raw, expected):
+    """DuckDB trim() strips spaces only, so collapse must happen first.
+
+    Regression: trimming first turned an edge tab into an edge space that
+    nothing removed, and a tab-only field became ' ' instead of NULL.
+    """
+    lit = chr(39) + raw + chr(39)
+    assert con.execute(f"SELECT {nz.sql_text(lit)}").fetchone()[0] == expected
 
 
 @pytest.mark.parametrize(
@@ -206,6 +314,54 @@ def test_every_state_fips_value_is_two_digits():
     assert set(nz.STATE_FIPS) == set(nz.VALID_STATE_CODES)
     assert all(len(v) == 2 and v.isdigit() for v in nz.STATE_FIPS.values())
     assert len(set(nz.STATE_FIPS.values())) == len(nz.STATE_FIPS), "FIPS codes must be unique"
+
+
+def test_latitude_bounds_are_not_longitude_bounds(con):
+    """A transposed lat/long pair must not pass as a valid latitude."""
+    Q = lambda v: chr(39) + v + chr(39)  # noqa: E731
+    assert con.execute(f"SELECT {nz.sql_coord(Q('150'), lo=-90, hi=90)}").fetchone()[0] is None
+    assert con.execute(f"SELECT {nz.sql_coord(Q('91'), lo=-90, hi=90)}").fetchone()[0] is None
+    assert con.execute(f"SELECT {nz.sql_coord(Q('41.18'), lo=-90, hi=90)}").fetchone()[0] == 41.18
+    assert con.execute(f"SELECT {nz.sql_coord(Q('-150'))}").fetchone()[0] == -150.0
+
+
+def test_quote_ident_escapes_embedded_quotes():
+    assert db.quote_ident("PLAIN") == '"PLAIN"'
+    assert db.quote_ident('ODD"NAME') == '"ODD""NAME"'
+    assert db.quote_literal("o'brien") == "'o''brien'"
+
+
+def test_build_views_survives_an_awkward_column_name(tmp_path):
+    """A quote in a column name must not produce unparseable SQL."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    d = tmp_path / "pq"
+    d.mkdir()
+    pq.write_table(
+        pa.table({"REGISTRY_ID": ["1"], 'ODD"NAME': ["A"], "PRIMARY NAME": ["B"]}),
+        d / "facility.parquet",
+    )
+    con = duckdb.connect()
+    assert db.build_views(con, d) == ["facility"]
+    cols = [c[0] for c in con.execute("SELECT * FROM facility LIMIT 0").description]
+    assert 'ODD"NAME' in cols and "PRIMARY NAME" in cols
+
+
+def test_derived_column_collision_is_an_error_not_a_silent_rename(tmp_path):
+    """DuckDB would dedupe to STATE_CODE_RAW_1 and misdirect every reader."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    d = tmp_path / "pq"
+    d.mkdir()
+    pq.write_table(
+        pa.table({"REGISTRY_ID": ["1"], "STATE_CODE": ["OH"], "STATE_CODE_RAW": ["ZZ"]}),
+        d / "facility.parquet",
+    )
+    con = duckdb.connect()
+    with pytest.raises(RuntimeError, match="collides with a derived column"):
+        db.build_views(con, d)
 
 
 def test_coord_rejects_zero_and_out_of_range(con):

@@ -73,6 +73,15 @@ character split across two reads survives.
 Deleting control bytes bytewise is safe on UTF-8: every byte of a multi-byte
 sequence has the high bit set, so a control byte can never appear inside one.
 
+Decoding uses an *incremental* decoder rather than a hand-rolled chunk
+realignment. That matters for correctness, not tidiness: the earlier version
+held a partial character back in a buffer and could return zero bytes while data
+remained, which `io.RawIOBase` defines as EOF — silently truncating the stream
+whenever a read ended on a partial character, or whenever a control-byte run
+filled a whole read block. The incremental decoder also makes repaired output
+independent of where read boundaries fall, so re-ingesting at a different block
+size cannot produce different strings.
+
 ## Normalisation rules
 
 | Rule | What it does |
@@ -88,18 +97,41 @@ sequence has the high bit set, so a control byte can never appear inside one.
 ### The two-digit year problem
 
 FRS dates are Oracle `DD-MON-YY`. C `strptime` maps `00`–`68` to 2000–2068 and
-`69`–`99` to 1969–1999. That is right for creation dates and wrong for mid-century
-permit and affiliation dates, which land a century in the future.
+`69`–`99` to 1969–1999. The second half is right. The first is right for recent
+dates and wrong for mid-century ones: a 1960 permit date written `01-JAN-60`
+comes back as 2060.
 
-Simply rejecting future dates does not work: permit *expiration* dates are
-legitimately in the future. So a parsed date more than **25 years** ahead of today
-is pulled back a century, and everything else is left alone. A 2035 permit expiry
-stays 2035; a `01-JAN-60` start date becomes 1960 rather than 2060.
+Only years landing in **2050–2068** are ambiguous. Below 2050 the modern reading
+is overwhelmingly more likely — a `25` is 2025, not 1925, in a registry that did
+not exist then — and 2069+ is unreachable from a two-digit year. So exactly that
+band is pulled back a century, and nothing else is touched.
 
-The rule is load-bearing. On the real extract it corrects **~54,000 dates**, and
-every value it touches is a genuine 1954–1968 date — the exact range where
-`strptime`'s pivot is wrong. `j2d frs qa` counts each adjustment, so the rule can
-never operate silently.
+The band is a fixed constant, not an offset from today. An earlier version used
+"more than 25 years in the future" and had two faults worth recording:
+
+- It left `50` and `51` unadjusted. **11,255 rows** kept a 2050/2051 date that is
+  really 1950/1951, while sibling rows in the same column dated 1952–1968 were
+  corrected — adjacent years split across two centuries.
+- The cutoff moved with the wall clock, so the same input Parquet produced
+  different dates depending on the day the build ran.
+
+The cost of the fixed band is that a genuine permit expiring in 2050–2068 would
+be dragged to the 1950s. This extract contains no such row — zero
+permit-expiration dates fall in the band — and `j2d frs qa` counts every
+adjustment, so the trade stays visible rather than assumed.
+
+The rule is load-bearing: it corrects **~65,000 dates**, every one of them a real
+1950–1968 value.
+
+### Whitespace
+
+`sql_text` collapses whitespace runs *before* trimming, not after. DuckDB's
+one-argument `trim` strips ASCII spaces only, so trimming first leaves an edge
+tab in place, and the `\s+` collapse then turns it into an edge *space* that
+nothing removes — and a field of nothing but a tab becomes `' '` rather than
+`NULL`, defeating the empty-to-NULL guard. The ingest deliberately preserves
+tab, CR and LF because they are structural in CSV, so these do reach the
+expression.
 
 ## The crosswalk
 
@@ -193,6 +225,19 @@ originally reported a clean zero. Its correlated subquery selected from the same
 table it filtered, so `STATE_CODE = facility.STATE_CODE` bound to the inner row
 and was always true; the subquery returned every prefix and `NOT IN (everything)`
 was always false. A check that structurally cannot fail is worse than no check.
+
+**EPA shipped mojibake.** The source already contains encoded U+FFFD replacement
+characters, across **834 rows** — 245 facility names, 198 facility addresses, 269
+alternative names, and the rest in organisation names and mailing addresses. A
+replacement character in a *published* file means the corruption happened
+upstream in EPA's own pipeline, and the original characters are unrecoverable
+from this download. `j2d frs qa` reports them under `source.mojibake_rows`. It
+matters for name-based matching: two spellings of the same facility may differ
+only in a character neither file still holds.
+
+The ingest's own `utf8_repaired` flag counts only bytes *it* replaced, using a
+codec error handler rather than by looking for U+FFFD in the output — otherwise
+EPA's pre-existing mojibake would be reported as our repairs.
 
 **Referential integrity is not guaranteed.** 8,415 program rows, 1,062
 supplemental-interest rows and 101 environmental-interest rows reference a

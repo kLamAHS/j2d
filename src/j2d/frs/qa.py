@@ -104,7 +104,12 @@ def check_orphans(con, present) -> list[Check]:
 
 
 def check_dates(con, present) -> list[Check]:
-    """Unparseable dates, and dates pulled back a century by the pivot rule."""
+    """Unparseable dates, and dates pulled back a century by the pivot rule.
+
+    The adjustment count is deliberately reported even when it is large: the
+    century rule is a judgement call about ambiguous input, and a silent
+    judgement call over 8 million rows is how a dataset quietly goes wrong.
+    """
     out = []
     for name, table in sorted(TABLES.items()):
         if name not in present or not table.date_columns:
@@ -117,7 +122,8 @@ def check_dates(con, present) -> list[Check]:
                 SELECT
                   sum(CASE WHEN raw IS NOT NULL AND parsed IS NULL THEN 1 ELSE 0 END),
                   sum(CASE WHEN parsed IS NOT NULL
-                            AND parsed > current_date + INTERVAL {nz.FUTURE_YEARS_ALLOWED} YEAR
+                            AND year(parsed) BETWEEN {nz.AMBIGUOUS_CENTURY_FIRST_YEAR}
+                                                 AND {nz.AMBIGUOUS_CENTURY_LAST_YEAR}
                            THEN 1 ELSE 0 END),
                   count(*)
                 FROM (
@@ -142,8 +148,9 @@ def check_dates(con, present) -> list[Check]:
                         f"dates.{name}.{col}.century_adjusted",
                         "warn",
                         adjusted,
-                        "two-digit year read as 20xx but shifted to 19xx "
-                        f"(> {nz.FUTURE_YEARS_ALLOWED}y in the future)",
+                        "two-digit year resolved to "
+                        f"{nz.AMBIGUOUS_CENTURY_FIRST_YEAR}-"
+                        f"{nz.AMBIGUOUS_CENTURY_LAST_YEAR} and shifted back a century",
                     )
                 )
     return out
@@ -224,11 +231,10 @@ def check_fips_shapes(con, present) -> list[Check]:
 
 
 def check_coordinates(con, present) -> list[Check]:
+    """Coordinate coverage, and range sanity when there is anything to check."""
     if "facility" not in present:
         return []
-    total, has = con.execute(
-        "SELECT count(*), count(LATITUDE83) FROM facility"
-    ).fetchone()
+    total, has = con.execute("SELECT count(*), count(LATITUDE83) FROM facility").fetchone()
     pct = 100.0 * has / total if total else 0
     out = [
         Check(
@@ -238,6 +244,19 @@ def check_coordinates(con, present) -> list[Check]:
             "facilities with a usable latitude",
         )
     ]
+    if has == 0:
+        # Reporting "0 bad coordinates" here would read as a clean bill of
+        # health for data that does not exist.
+        out.append(
+            Check(
+                "facility.coordinates_outside_us",
+                "warn",
+                "not applicable",
+                "no coordinates in this extract; the range check cannot run. "
+                "Geospatial data needs EPA's separate download.",
+            )
+        )
+        return out
     off = con.execute(
         "SELECT count(*) FROM facility WHERE LATITUDE83 IS NOT NULL "
         "AND (LATITUDE83 NOT BETWEEN 17 AND 72 OR LONGITUDE83 NOT BETWEEN -180 AND -64)"
@@ -248,6 +267,45 @@ def check_coordinates(con, present) -> list[Check]:
             "ok" if off == 0 else "warn",
             off,
             "coordinates outside a generous US bounding box",
+        )
+    )
+    return out
+
+
+def check_source_mojibake(con, present) -> list[Check]:
+    """U+FFFD characters EPA shipped in the source text.
+
+    A replacement character in a published file means the corruption happened
+    upstream, in EPA's own extract pipeline, and the original characters are
+    unrecoverable from this file. Worth knowing before trusting a name match.
+    """
+    out = []
+    targets = [
+        ("facility", "PRIMARY_NAME"),
+        ("facility", "LOCATION_ADDRESS"),
+        ("alternative_name", "ALTERNATIVE_NAME"),
+        ("organization", "ORG_NAME"),
+        ("mailing_address", "MAILING_ADDRESS"),
+    ]
+    total = 0
+    rows = []
+    for table, col in targets:
+        if table not in present:
+            continue
+        n = con.execute(
+            f"SELECT count(*) FROM raw_{table} WHERE contains(\"{col}\", chr(65533))"
+        ).fetchone()[0]
+        if n:
+            rows.append((f"{table}.{col}", n))
+        total += n
+    out.append(
+        Check(
+            "source.mojibake_rows",
+            "ok" if total == 0 else "warn",
+            total,
+            "rows whose text already contains U+FFFD as published by EPA; "
+            "the original characters are not recoverable from this file",
+            rows=rows,
         )
     )
     return out
@@ -309,6 +367,7 @@ ALL_CHECKS = (
     check_state_codes,
     check_fips_shapes,
     check_coordinates,
+    check_source_mojibake,
     check_crosswalk_agreement,
     check_single_source_links,
 )

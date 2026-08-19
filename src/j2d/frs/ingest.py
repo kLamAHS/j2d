@@ -8,7 +8,9 @@ Peak memory is one batch, not one table.
 
 from __future__ import annotations
 
+import codecs
 import io
+import itertools
 import time
 import zipfile
 from dataclasses import dataclass
@@ -57,6 +59,28 @@ class IngestResult:
 _CONTROL_BYTES = bytes(b for b in range(0x20) if b not in (0x09, 0x0A, 0x0D))
 
 
+class _ReplaceCounter:
+    """A codec error handler that counts the bytes it replaces.
+
+    Kept separate from the sanitiser because ``codecs.register_error`` holds its
+    handler forever; registering a bound method would pin the whole sanitiser,
+    and with it the stream it wraps. This object is a few bytes.
+    """
+
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __call__(self, exc: UnicodeDecodeError):
+        self.count += exc.end - exc.start
+        return ("\ufffd", exc.end)
+
+
+#: Distinguishes the error-handler name registered per sanitiser instance.
+_HANDLER_SEQ = itertools.count()
+
+
 class _TextSanitiser(io.RawIOBase):
     """Wrap a binary stream, removing control bytes and repairing bad UTF-8.
 
@@ -72,58 +96,69 @@ class _TextSanitiser(io.RawIOBase):
     2. **Invalid UTF-8.** Arrow rejects an entire batch on the first bad byte.
        Decoding with ``errors="replace"`` keeps the row.
 
-    Chunks are re-aligned so a multi-byte character split across two reads
-    survives intact.
+    Decoding uses an *incremental* decoder, so a multi-byte character split
+    across two reads is carried in the decoder's own state. That matters for
+    more than tidiness: an earlier hand-rolled version held the partial
+    sequence back in a buffer and could return 0 bytes while data remained,
+    which ``io.RawIOBase`` defines as EOF — silently truncating the stream.
+    The incremental decoder also makes the repaired output independent of where
+    the read boundaries fall, so re-ingesting at a different block size cannot
+    produce different strings.
+
+    ``readinto`` never returns 0 unless the underlying stream is genuinely
+    exhausted; it keeps pulling until it has at least one byte to hand back.
     """
+
+    #: Fallback read size when a caller passes a zero-length buffer.
+    _MIN_READ = 1 << 16
 
     def __init__(self, raw: io.BufferedIOBase) -> None:
         self._raw = raw
-        self._tail = b""
         self._pending = b""
+        self._eof = False
         self.control_bytes_removed = 0
-        self.utf8_repaired = False
+        #: Source bytes this instance actually replaced with U+FFFD.
+        #:
+        #: Counted by a private error handler rather than by looking for U+FFFD
+        #: in the output, because EPA's own extract already contains 1,228
+        #: encoded U+FFFD characters - mojibake produced upstream, before the
+        #: file was published. Counting output characters would report those as
+        #: our repairs and make the diagnostic useless.
+        self.invalid_bytes_replaced = 0
+        self._handler = _ReplaceCounter()
+        name = f"j2d.frs.replace.{next(_HANDLER_SEQ)}"
+        codecs.register_error(name, self._handler)
+        self._decoder = codecs.getincrementaldecoder("utf-8")(name)
+
+    @property
+    def utf8_repaired(self) -> bool:
+        """True if this instance replaced any invalid byte."""
+        return self.invalid_bytes_replaced > 0
 
     def readable(self) -> bool:  # pragma: no cover - trivial
         return True
 
+    def _fill(self, size: int) -> None:
+        """Pull from the raw stream until ``_pending`` has bytes, or EOF."""
+        while not self._pending and not self._eof:
+            chunk = self._raw.read(size)
+            if chunk:
+                stripped = chunk.translate(None, _CONTROL_BYTES)
+                self.control_bytes_removed += len(chunk) - len(stripped)
+                text = self._decoder.decode(stripped)
+            else:
+                self._eof = True
+                text = self._decoder.decode(b"", final=True)
+            self.invalid_bytes_replaced = self._handler.count
+            self._pending = text.encode("utf-8")
+
     def readinto(self, buf) -> int:
         want = len(buf)
-        if self._pending:
-            out = self._pending[:want]
-            self._pending = self._pending[want:]
-            buf[: len(out)] = out
-            return len(out)
-
-        chunk = self._raw.read(want)
-        if not chunk and not self._tail:
+        if want == 0:
             return 0
-        data = self._tail + chunk
-        self._tail = b""
-
-        if chunk:
-            # Hold back a trailing partial multi-byte sequence for the next read.
-            for back in range(1, min(4, len(data)) + 1):
-                if data[-back] & 0xC0 != 0x80:
-                    if data[-back] & 0x80:
-                        self._tail = data[-back:]
-                        data = data[:-back]
-                    break
-
-        stripped = data.translate(None, _CONTROL_BYTES)
-        if len(stripped) != len(data):
-            self.control_bytes_removed += len(data) - len(stripped)
-        data = stripped
-
-        try:
-            out = data.decode("utf-8").encode("utf-8")
-        except UnicodeDecodeError:
-            self.utf8_repaired = True
-            out = data.decode("utf-8", errors="replace").encode("utf-8")
-
-        if len(out) > want:
-            # Replacement characters can grow the buffer; queue the overflow.
-            self._pending = out[want:]
-            out = out[:want]
+        self._fill(max(want, self._MIN_READ))
+        out = self._pending[:want]
+        self._pending = self._pending[len(out):]
         buf[: len(out)] = out
         return len(out)
 
