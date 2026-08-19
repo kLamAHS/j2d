@@ -82,6 +82,7 @@ sequence has the high bit set, so a control byte can never appear inside one.
 | country | `USA` / `UNITED STATES` / `UNITED STATES OF AMERICA` → `US` |
 | state | uppercase; outside the USPS domain → `NULL`, kept in `STATE_CODE_RAW` |
 | postal | `POSTAL_CODE_ZIP5` derived from the first five digits |
+| fips | `FIPS_CODE_COUNTY5` derived, populated only when genuinely a county FIPS |
 | coords | cast to `DOUBLE`; zero and out-of-range → `NULL` |
 
 ### The two-digit year problem
@@ -165,14 +166,42 @@ columns exist in the schema and carry no data. **You cannot map anything from th
 file** — coordinates need EPA's separate geospatial download or the FRS API. This
 is the single most consequential thing to know before planning work on it.
 
+**`FIPS_CODE` mixes four incompatible formats.** Only 3,594,816 of the 4,249,460
+non-null values are a real 5-digit county FIPS:
+
+| Shape | Rows | Example |
+|---|---:|---|
+| 5-digit numeric county FIPS | 3,594,816 | `39155` |
+| null | 1,069,679 | |
+| USPS prefix + 3 digits | 498,920 | `AK090` — not a FIPS code at all |
+| numeric, wrong length | 154,962 | `04` — state only |
+| other | 762 | |
+
+A further **43,126** rows pass the shape test but contradict their own
+`STATE_CODE`: they are county codes zero-padded to five digits with the state
+prefix missing, so Seattle appears as `00033` where King County, WA is `53033`.
+These look valid and join to the wrong county, which is worse than not joining.
+
+Net: **3,551,689 trustworthy county FIPS out of 5,319,139 facilities — 67%.**
+Joining census or ACS data on the raw column silently drops about a third of the
+rows and silently mis-joins another 43,126. Use the derived `FIPS_CODE_COUNTY5`,
+which is populated only when the value is five numeric digits *and* its state
+prefix agrees with `STATE_CODE`.
+
+This one is worth dwelling on because the check that was supposed to catch it
+originally reported a clean zero. Its correlated subquery selected from the same
+table it filtered, so `STATE_CODE = facility.STATE_CODE` bound to the inner row
+and was always true; the subquery returned every prefix and `NOT IN (everything)`
+was always false. A check that structurally cannot fail is worse than no check.
+
 **Referential integrity is not guaranteed.** 8,415 program rows, 1,062
 supplemental-interest rows and 101 environmental-interest rows reference a
 `REGISTRY_ID` with no facility record. Inner-joining to `facility` silently drops
 them.
 
 **Obsolete state codes.** `TT` (Trust Territory of the Pacific Islands, dissolved
-1994) appears on 15 facilities. `FM`, `MH` and `PW` also appear and *are* valid
-USPS codes for the freely associated states.
+1994) appears on 15 facilities and is rejected. `FM`, `MH` and `PW` also appear
+and *are* valid USPS codes for the freely associated states, so they are accepted.
 
 **The bundled documentation is stale.** `Facility State File Documentation
 11132012_new.pdf` is version 1.1.1 from November 2012. It documents 28 columns for
@@ -180,6 +209,23 @@ the facility file where the current extract has 34, and 51 for the program file
 where the extract has 55. It also describes a `GIS_program` file that this archive
 does not contain. Treat it as a starting point, not as authority — the registry it
 describes had "over 2.5 million" facilities; this one has 5.3 million.
+
+## Personal data
+
+The `contact` table is entirely personal data — names, direct phone numbers and
+email addresses for 4,656,542 facility contacts. `organization` carries some too.
+
+`--no-pii` excludes the `contact` table outright and drops the personal columns
+from `organization`:
+
+```bash
+j2d frs ingest --no-pii
+```
+
+It refuses to "filter" an all-personal table rather than quietly writing a
+column-less one, because an empty column list is falsy and would otherwise be
+handed to Arrow as `None`, meaning *all columns* — writing the full table with
+the personal data intact. There is a regression test for exactly that.
 
 ## Scale
 

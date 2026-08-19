@@ -176,6 +176,38 @@ def test_zip5(con):
     assert con.execute(f"SELECT {nz.sql_zip5(chr(39) + 'ABCDE' + chr(39))}").fetchone()[0] is None
 
 
+@pytest.mark.parametrize(
+    "fips,state,expected",
+    [
+        ("39155", "OH", "39155"),   # Trumbull County, Ohio - agrees
+        ("02020", "AK", "02020"),   # leading zero preserved
+        ("12345", "OH", None),      # 12 is Florida, contradicts STATE_CODE
+        ("AK090", "AK", None),      # USPS-prefixed hybrid, not a FIPS code
+        ("04", "AZ", None),         # state only, wrong length
+        ("39155", "XX", None),      # unknown state, cannot be verified
+    ],
+)
+def test_county_fips_only_accepts_a_real_county_fips(con, fips, state, expected):
+    expr = nz.sql_county_fips(chr(39) + fips + chr(39), chr(39) + state + chr(39))
+    assert con.execute(f"SELECT {expr}").fetchone()[0] == expected
+
+
+@pytest.mark.parametrize("code", ["FM", "MH", "PW", "PR", "GU", "AS", "MP", "VI", "UM"])
+def test_territory_and_freely_associated_codes_are_valid(con, code):
+    """FM/MH/PW are genuine USPS codes and appear in the real extract."""
+    assert con.execute(f"SELECT {nz.sql_state(chr(39) + code + chr(39))}").fetchone()[0] == code
+
+
+def test_trust_territory_is_rejected_as_obsolete(con):
+    assert con.execute(f"SELECT {nz.sql_state(chr(39) + 'TT' + chr(39))}").fetchone()[0] is None
+
+
+def test_every_state_fips_value_is_two_digits():
+    assert set(nz.STATE_FIPS) == set(nz.VALID_STATE_CODES)
+    assert all(len(v) == 2 and v.isdigit() for v in nz.STATE_FIPS.values())
+    assert len(set(nz.STATE_FIPS.values())) == len(nz.STATE_FIPS), "FIPS codes must be unique"
+
+
 def test_coord_rejects_zero_and_out_of_range(con):
     assert con.execute(f"SELECT {nz.sql_coord(chr(39) + '41.18' + chr(39))}").fetchone()[0] == 41.18
     assert con.execute(f"SELECT {nz.sql_coord(chr(39) + '0' + chr(39))}").fetchone()[0] is None
@@ -244,6 +276,22 @@ def test_normalised_view_applies_rules(built):
         con.close()
 
 
+def test_county_fips_derived_column(built):
+    con = db.connect(built["db_path"], read_only=True)
+    try:
+        good = con.execute(
+            "SELECT FIPS_CODE, FIPS_CODE_COUNTY5 FROM facility WHERE REGISTRY_ID='110000000001'"
+        ).fetchone()
+        assert good == ("39155", "39155")
+        # STATE_CODE is 'XX' here, so the FIPS cannot be corroborated.
+        bad = con.execute(
+            "SELECT FIPS_CODE, FIPS_CODE_COUNTY5 FROM facility WHERE REGISTRY_ID='110000000002'"
+        ).fetchone()
+        assert bad == ("05139", None)
+    finally:
+        con.close()
+
+
 def test_bad_state_code_nulled_but_preserved_raw(built):
     con = db.connect(built["db_path"], read_only=True)
     try:
@@ -254,6 +302,44 @@ def test_bad_state_code_nulled_but_preserved_raw(built):
         assert raw == "XX"
     finally:
         con.close()
+
+
+def test_no_pii_excludes_the_contact_table_entirely(mini_zip, tmp_path):
+    """An all-PII table must be skipped, not column-filtered.
+
+    Regression: dropping every column left include_columns == [], and `[] or
+    None` handed Arrow None, meaning "all columns" - so the table was written
+    in full with the personal data intact.
+    """
+    from j2d.frs.ingest import ingest_all
+
+    results = ingest_all(mini_zip, tmp_path / "pq", drop_pii=True)
+    assert "contact" not in {r.table for r in results}
+    assert not (tmp_path / "pq" / "contact.parquet").exists()
+
+
+def test_no_pii_strips_pii_columns_from_mixed_tables(mini_zip, tmp_path):
+    import duckdb
+
+    from j2d.frs.ingest import ingest_all
+    from j2d.frs.schema import PII_COLUMNS
+
+    ingest_all(mini_zip, tmp_path / "pq", drop_pii=True, only=["organization"])
+    con = duckdb.connect()
+    path = (tmp_path / "pq" / "organization.parquet").as_posix()
+    cols = {d[0] for d in con.execute(f"SELECT * FROM read_parquet('{path}') LIMIT 0").description}
+    assert not cols & set(PII_COLUMNS["organization"])
+    assert "ORG_NAME" in cols, "non-PII columns must survive"
+
+
+def test_ingest_table_refuses_to_filter_an_all_pii_table(mini_zip, tmp_path):
+    import pytest as _pytest
+
+    from j2d.frs.ingest import ingest_table
+    from j2d.frs.schema import TABLES
+
+    with _pytest.raises(ValueError, match="entirely personal data"):
+        ingest_table(mini_zip, TABLES["contact"], tmp_path / "pq", drop_pii=True)
 
 
 # --------------------------------------------------------------------------
@@ -324,6 +410,7 @@ def test_qa_runs_and_flags_the_planted_defects(built):
     by_name = {c.name: c for c in checks}
     assert by_name["facility.registry_id_unique"].status == "ok"
     assert by_name["facility.state_code_out_of_domain"].value == 1
+    assert "facility.fips_code_shapes" in by_name
     # The env-interest row for 110000000009 has no facility record.
     assert by_name["orphans.environmental_interest"].value == 1
     assert qa.summarise(checks)["fail"] == 0

@@ -169,28 +169,58 @@ def check_state_codes(con, present) -> list[Check]:
     ]
 
 
-def check_state_fips_agreement(con, present) -> list[Check]:
-    """FIPS_CODE encodes the state in its first two digits; it should agree."""
+def check_fips_shapes(con, present) -> list[Check]:
+    """``FIPS_CODE`` mixes four incompatible formats; only one is a county FIPS.
+
+    This replaced an earlier check whose correlated subquery referenced the same
+    table it selected from, so the inner ``STATE_CODE = facility.STATE_CODE``
+    bound to the *inner* row and was always true. The subquery therefore returned
+    every prefix and ``NOT IN (everything)`` was always false: the check reported
+    zero disagreements no matter what the data said. A check that structurally
+    cannot fail is worse than no check, because it manufactures confidence.
+    """
     if "facility" not in present:
         return []
-    n = con.execute(
+    rows = con.execute(
         """
-        SELECT count(*) FROM facility
-        WHERE FIPS_CODE IS NOT NULL AND STATE_CODE IS NOT NULL
-          AND length(FIPS_CODE) = 5
-          AND substr(FIPS_CODE, 1, 2) NOT IN (
-              SELECT DISTINCT substr(FIPS_CODE, 1, 2) FROM facility
-              WHERE STATE_CODE = facility.STATE_CODE)
+        SELECT CASE
+                 WHEN FIPS_CODE IS NULL THEN 'null'
+                 WHEN regexp_matches(FIPS_CODE, '^[0-9]{5}$') THEN 'county_fips_5'
+                 WHEN regexp_matches(FIPS_CODE, '^[A-Z]{2}[0-9]{3}$') THEN 'usps_prefix_3'
+                 WHEN regexp_matches(FIPS_CODE, '^[0-9]+$') THEN 'numeric_wrong_length'
+                 ELSE 'other' END AS shape,
+               count(*) AS n
+        FROM facility GROUP BY 1 ORDER BY n DESC
         """
-    ).fetchone()[0]
-    return [
+    ).fetchall()
+    shapes = dict(rows)
+    nonnull = sum(n for sh, n in rows if sh != "null")
+    usable = shapes.get("county_fips_5", 0)
+    unusable = nonnull - usable
+    out = [
         Check(
-            "facility.state_fips_disagreement",
-            "ok" if n == 0 else "warn",
-            n,
-            "facilities whose FIPS state prefix conflicts with STATE_CODE",
+            "facility.fips_code_shapes",
+            "ok" if unusable == 0 else "warn",
+            f"{usable:,} usable of {nonnull:,} non-null",
+            "FIPS_CODE mixes formats; only 5-digit numeric is a county FIPS",
+            rows=rows,
         )
     ]
+    mismatch = con.execute(
+        "SELECT count(*) FROM facility "
+        "WHERE regexp_matches(FIPS_CODE, '^[0-9]{5}$') AND STATE_CODE IS NOT NULL "
+        "  AND FIPS_CODE_COUNTY5 IS NULL"
+    ).fetchone()[0]
+    out.append(
+        Check(
+            "facility.fips_state_disagreement",
+            "ok" if mismatch == 0 else "warn",
+            mismatch,
+            "rows whose 5-digit FIPS state prefix contradicts STATE_CODE; "
+            "excluded from FIPS_CODE_COUNTY5",
+        )
+    )
+    return out
 
 
 def check_coordinates(con, present) -> list[Check]:
@@ -241,16 +271,16 @@ def check_crosswalk_agreement(con, present) -> list[Check]:
     only_fac, only_prog, total = (r or 0 for r in rows)
     return [
         Check(
-            "crosswalk.only_in_facility_acrnms",
+            "crosswalk.in_facility_string_not_program_table",
             "ok" if only_fac == 0 else "warn",
             only_fac,
-            f"of {total:,} links; asserted by the denormalised facility string only",
+            f"of {total:,} links; in the facility string but absent from the program table",
         ),
         Check(
-            "crosswalk.only_in_program_table",
+            "crosswalk.in_program_table_not_facility_string",
             "ok" if only_prog == 0 else "warn",
             only_prog,
-            f"of {total:,} links; asserted by the program table only",
+            f"of {total:,} links; in the program table but absent from the facility string",
         ),
     ]
 
@@ -277,7 +307,7 @@ ALL_CHECKS = (
     check_orphans,
     check_dates,
     check_state_codes,
-    check_state_fips_agreement,
+    check_fips_shapes,
     check_coordinates,
     check_crosswalk_agreement,
     check_single_source_links,

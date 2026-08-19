@@ -155,6 +155,15 @@ def ingest_table(
     Returns an :class:`IngestResult`; raises nothing on an already-present
     output unless ``force`` is set, in which case it is rewritten.
     """
+    if drop_pii and table.name in PII_TABLES:
+        # Dropping every column would leave include_columns empty, and an empty
+        # list is falsy: `[] or None` hands Arrow None, which means "all
+        # columns". The table would be written in full, PII included. Refuse
+        # instead - an entirely-personal table must be excluded, not filtered.
+        raise ValueError(
+            f"{table.name} is entirely personal data; exclude the table rather "
+            f"than filtering its columns"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{table.name}.parquet"
     if out_path.exists() and not force:
@@ -180,6 +189,10 @@ def ingest_table(
                 drop.update(names)
             drop.update(c for c in PII_COLUMNS.get(table.name, ()) if c in names)
 
+        keep = [n for n in names if n not in drop]
+        if not keep:
+            raise ValueError(f"{table.member}: every column was dropped")
+
         with zf.open(table.member) as raw:
             sanitiser = _TextSanitiser(raw)
             stream = io.BufferedReader(sanitiser, buffer_size=BLOCK_SIZE)
@@ -190,7 +203,7 @@ def ingest_table(
                 convert_options=pcsv.ConvertOptions(
                     column_types=_all_string_types(names),
                     strings_can_be_null=True,
-                    include_columns=[n for n in names if n not in drop] or None,
+                    include_columns=keep,
                 ),
             )
             writer: pq.ParquetWriter | None = None
@@ -246,6 +259,12 @@ def ingest_all(
         sizes = {i.filename: i.file_size for i in zf.infolist()}
     lookup = member_to_table()
     wanted = [t for t in lookup.values() if only is None or t.name in only]
+    if drop_pii:
+        excluded = [t.name for t in wanted if t.name in PII_TABLES]
+        if excluded and progress:
+            for name in excluded:
+                progress(f"skip   {name:<24} (entirely personal data; --no-pii)")
+        wanted = [t for t in wanted if t.name not in PII_TABLES]
     wanted.sort(key=lambda t: sizes.get(t.member, 0))
 
     results = []

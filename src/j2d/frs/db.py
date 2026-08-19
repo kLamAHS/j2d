@@ -62,6 +62,11 @@ def _derived_columns(table: Table, cols: list[str]) -> list[str]:
     if "STATE_CODE" in cols:
         # Preserve the value we nulled, so an out-of-domain code stays visible.
         out.append(nz.sql_upper('"STATE_CODE"') + ' AS "STATE_CODE_RAW"')
+    if "FIPS_CODE" in cols and "STATE_CODE" in cols:
+        # FIPS_CODE holds four incompatible shapes; only one is a county FIPS.
+        out.append(
+            nz.sql_county_fips('"FIPS_CODE"', '"STATE_CODE"') + ' AS "FIPS_CODE_COUNTY5"'
+        )
     return out
 
 
