@@ -188,7 +188,7 @@ the acronym split is safe.
 
 ## Known defects in the source data
 
-Measured by `j2d frs qa` on the current extract. These are EPA's, not the
+Measured by `j2d frs qa` on the current extract — 34 ok, 27 warn, 0 fail. These are EPA's, not the
 pipeline's — the point of the report is that you model around them knowingly.
 
 **Geospatial columns are entirely empty.** All 5,319,139 facility rows have NULL
@@ -226,18 +226,20 @@ table it filtered, so `STATE_CODE = facility.STATE_CODE` bound to the inner row
 and was always true; the subquery returned every prefix and `NOT IN (everything)`
 was always false. A check that structurally cannot fail is worse than no check.
 
-**EPA shipped mojibake.** The source already contains encoded U+FFFD replacement
-characters, across **834 rows** — 245 facility names, 198 facility addresses, 269
-alternative names, and the rest in organisation names and mailing addresses. A
-replacement character in a *published* file means the corruption happened
-upstream in EPA's own pipeline, and the original characters are unrecoverable
-from this download. `j2d frs qa` reports them under `source.mojibake_rows`. It
-matters for name-based matching: two spellings of the same facility may differ
-only in a character neither file still holds.
+**EPA shipped mojibake.** The source contains **5,260 encoded U+FFFD replacement
+characters** — 2,462 in the program file, 1,128 in the facility file, 783 in
+alternative names, and so on — touching 834 rows of the text columns the QA
+report samples. A replacement character in a *published* file means the
+corruption happened upstream in EPA's own pipeline, and the original characters
+are unrecoverable from this download. It matters for name-based matching: two
+spellings of the same facility may differ only in a character neither file
+still holds.
 
-The ingest's own `utf8_repaired` flag counts only bytes *it* replaced, using a
-codec error handler rather than by looking for U+FFFD in the output — otherwise
-EPA's pre-existing mojibake would be reported as our repairs.
+Attribution is deliberate. The ingest counts U+FFFD in the *source bytes*
+(`[N U+FFFD already in source]`) separately from bytes it repaired itself
+(`[utf8 repaired]`, driven by a codec error handler). On this extract the second
+never appears, so every one of those 5,260 characters is EPA's. Measuring only
+the output would have reported our own repairs as EPA's damage.
 
 **Referential integrity is not guaranteed.** 8,415 program rows, 1,062
 supplemental-interest rows and 101 environmental-interest rows reference a

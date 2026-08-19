@@ -2,8 +2,14 @@
 
 The checks *measure*; they never mutate. Anything that would drop or rewrite a
 row belongs in :mod:`j2d.frs.normalize`, where it is a visible, testable rule.
-The output of a run is a list of :class:`Check` results — a report you can
-diff between two monthly FRS extracts to see what EPA changed underneath you.
+The output of a run is a list of :class:`Check` results — a report you can diff
+between two monthly FRS extracts to see what EPA changed underneath you.
+
+That diffing use is why the report has a **stable shape**. A check that could
+not run emits a ``skipped.*`` entry rather than vanishing, because an absent
+line and a passing line are indistinguishable in a diff, and "no news" would
+read as good news. For the same reason a failing check costs one line, not the
+whole family: the per-table loops catch their own errors.
 
 Severity is deliberately blunt:
 
@@ -21,7 +27,7 @@ Severity is deliberately blunt:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import duckdb
 
@@ -38,33 +44,68 @@ class Check:
     rows: list[tuple] = field(default_factory=list)
 
     def __str__(self) -> str:
-        mark = {"ok": "ok  ", "warn": "WARN", "fail": "FAIL"}[self.status]
+        mark = {"ok": "ok  ", "warn": "WARN", "fail": "FAIL", "skip": "SKIP"}.get(
+            self.status, self.status
+        )
         head = f"[{mark}] {self.name}: {self.value}"
         return head + (f"\n         {self.detail}" if self.detail else "")
 
 
-def _views(con: duckdb.DuckDBPyConnection) -> set[str]:
+def requires(*tables: str) -> Callable:
+    """Mark the relations a check needs, so a skip is reported rather than silent."""
+
+    def deco(fn):
+        fn.requires = tables
+        return fn
+
+    return deco
+
+
+def _relations(con: duckdb.DuckDBPyConnection) -> set[str]:
+    """Tables and views in the *current* database's main schema.
+
+    Scoped deliberately. An unscoped ``information_schema.tables`` spans every
+    attached catalog, so ATTACHing last month's database — the obvious thing to
+    do when diffing two reports — would make this month's checks believe in
+    relations they cannot actually query.
+    """
     rows = con.execute(
         "SELECT table_name FROM information_schema.tables "
-        "UNION SELECT view_name FROM duckdb_views()"
+        "WHERE table_catalog = current_database() AND table_schema = 'main'"
     ).fetchall()
     return {r[0] for r in rows}
 
 
-def check_row_counts(con: duckdb.DuckDBPyConnection, present: set[str]) -> list[Check]:
+def _safe(fn, *args) -> list[Check]:
+    """Run one measurement, turning any failure into a single Check."""
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 - a broken check must cost one line
+        return [Check(getattr(fn, "__name__", "check"), "fail", "error", str(exc)[:200])]
+
+
+# --------------------------------------------------------------------------
+# checks
+# --------------------------------------------------------------------------
+
+
+def check_row_counts(con, present) -> list[Check]:
     out = []
     for name in sorted(TABLES):
-        if name not in present:
+        if f"raw_{name}" not in present:
             out.append(Check(f"rows.{name}", "warn", 0, "table not ingested"))
             continue
-        n = con.execute(f"SELECT count(*) FROM raw_{name}").fetchone()[0]
+        try:
+            n = con.execute(f"SELECT count(*) FROM raw_{name}").fetchone()[0]
+        except Exception as exc:  # noqa: BLE001
+            out.append(Check(f"rows.{name}", "fail", "error", str(exc)[:150]))
+            continue
         out.append(Check(f"rows.{name}", "ok" if n else "fail", n))
     return out
 
 
+@requires("raw_facility")
 def check_facility_key_unique(con, present) -> list[Check]:
-    if "facility" not in present:
-        return []
     dup = con.execute(
         "SELECT count(*) FROM (SELECT REGISTRY_ID FROM raw_facility "
         "GROUP BY 1 HAVING count(*) > 1)"
@@ -79,92 +120,105 @@ def check_facility_key_unique(con, present) -> list[Check]:
     ]
 
 
+@requires("raw_facility")
 def check_orphans(con, present) -> list[Check]:
     """Child rows whose REGISTRY_ID has no facility record."""
-    if "facility" not in present:
-        return []
     out = []
     for name in sorted(TABLES):
-        if name in ("facility",) or name not in present:
+        if name == "facility" or f"raw_{name}" not in present:
             continue
-        n = con.execute(
-            f"SELECT count(*) FROM raw_{name} c "
-            "WHERE NOT EXISTS (SELECT 1 FROM raw_facility f "
-            "                  WHERE f.REGISTRY_ID = c.REGISTRY_ID)"
-        ).fetchone()[0]
-        out.append(
-            Check(
-                f"orphans.{name}",
-                "ok" if n == 0 else "warn",
-                n,
-                "rows referencing a REGISTRY_ID absent from the facility table",
-            )
-        )
+
+        def one(name=name):
+            n = con.execute(
+                f"SELECT count(*) FROM raw_{name} c "
+                "WHERE NOT EXISTS (SELECT 1 FROM raw_facility f "
+                "                  WHERE f.REGISTRY_ID = c.REGISTRY_ID)"
+            ).fetchone()[0]
+            return [
+                Check(
+                    f"orphans.{name}",
+                    "ok" if n == 0 else "warn",
+                    n,
+                    "rows referencing a REGISTRY_ID absent from the facility table",
+                )
+            ]
+
+        out.extend(_safe(one))
     return out
 
 
 def check_dates(con, present) -> list[Check]:
     """Unparseable dates, and dates pulled back a century by the pivot rule.
 
-    The adjustment count is deliberately reported even when it is large: the
-    century rule is a judgement call about ambiguous input, and a silent
-    judgement call over 8 million rows is how a dataset quietly goes wrong.
+    The adjustment count is reported even when it is large: the century rule is
+    a judgement call about ambiguous input, and a silent judgement call over 8
+    million rows is how a dataset quietly goes wrong.
     """
     out = []
     for name, table in sorted(TABLES.items()):
-        if name not in present or not table.date_columns:
+        if f"raw_{name}" not in present or not table.date_columns:
             continue
         cols = {d[0] for d in con.execute(f"SELECT * FROM raw_{name} LIMIT 0").description}
         for col in table.date_columns:
             if col not in cols:
                 continue
-            q = f"""
-                SELECT
-                  sum(CASE WHEN raw IS NOT NULL AND parsed IS NULL THEN 1 ELSE 0 END),
-                  sum(CASE WHEN parsed IS NOT NULL
-                            AND year(parsed) BETWEEN {nz.AMBIGUOUS_CENTURY_FIRST_YEAR}
-                                                 AND {nz.AMBIGUOUS_CENTURY_LAST_YEAR}
-                           THEN 1 ELSE 0 END),
-                  count(*)
-                FROM (
-                  SELECT nullif(trim("{col}"), '') AS raw,
-                         try_strptime(nullif(trim("{col}"), ''), '%d-%b-%y') AS parsed
-                  FROM raw_{name}
-                )
-            """
-            bad, adjusted, total = con.execute(q).fetchone()
-            bad, adjusted = bad or 0, adjusted or 0
-            out.append(
-                Check(
-                    f"dates.{name}.{col}.unparseable",
-                    "ok" if bad == 0 else "warn",
-                    bad,
-                    f"of {total:,} rows; these become NULL",
-                )
-            )
-            if adjusted:
-                out.append(
-                    Check(
-                        f"dates.{name}.{col}.century_adjusted",
-                        "warn",
-                        adjusted,
-                        "two-digit year resolved to "
-                        f"{nz.AMBIGUOUS_CENTURY_FIRST_YEAR}-"
-                        f"{nz.AMBIGUOUS_CENTURY_LAST_YEAR} and shifted back a century",
+
+            def one(name=name, col=col):
+                q = f"""
+                    SELECT
+                      sum(CASE WHEN raw IS NOT NULL AND parsed IS NULL THEN 1 ELSE 0 END),
+                      sum(CASE WHEN parsed IS NOT NULL
+                                AND year(parsed) BETWEEN {nz.AMBIGUOUS_CENTURY_FIRST_YEAR}
+                                                     AND {nz.AMBIGUOUS_CENTURY_LAST_YEAR}
+                               THEN 1 ELSE 0 END),
+                      count(*)
+                    FROM (
+                      SELECT nullif(trim("{col}"), '') AS raw,
+                             try_strptime(nullif(trim("{col}"), ''), '%d-%b-%y') AS parsed
+                      FROM raw_{name}
                     )
-                )
+                """
+                bad, adjusted, total = con.execute(q).fetchone()
+                bad, adjusted = bad or 0, adjusted or 0
+                res = [
+                    Check(
+                        f"dates.{name}.{col}.unparseable",
+                        "ok" if bad == 0 else "warn",
+                        bad,
+                        f"of {total:,} rows; these become NULL",
+                    )
+                ]
+                if adjusted:
+                    res.append(
+                        Check(
+                            f"dates.{name}.{col}.century_adjusted",
+                            "warn",
+                            adjusted,
+                            "two-digit year resolved to "
+                            f"{nz.AMBIGUOUS_CENTURY_FIRST_YEAR}-"
+                            f"{nz.AMBIGUOUS_CENTURY_LAST_YEAR} and shifted back a century",
+                        )
+                    )
+                return res
+
+            out.extend(_safe(one))
     return out
 
 
+@requires("facility")
 def check_state_codes(con, present) -> list[Check]:
-    if "facility" not in present:
-        return []
+    # The total is a separate un-limited aggregate. Summing the LIMITed sample
+    # would cap the headline at the twenty most common bad codes and hide any
+    # growth in the tail - exactly the regression a monthly diff exists to catch.
+    total = con.execute(
+        "SELECT count(*) FROM facility "
+        "WHERE STATE_CODE IS NULL AND STATE_CODE_RAW IS NOT NULL"
+    ).fetchone()[0]
     rows = con.execute(
         "SELECT STATE_CODE_RAW, count(*) c FROM facility "
         "WHERE STATE_CODE IS NULL AND STATE_CODE_RAW IS NOT NULL "
         "GROUP BY 1 ORDER BY c DESC LIMIT 20"
     ).fetchall()
-    total = sum(r[1] for r in rows)
     return [
         Check(
             "facility.state_code_out_of_domain",
@@ -176,6 +230,7 @@ def check_state_codes(con, present) -> list[Check]:
     ]
 
 
+@requires("facility")
 def check_fips_shapes(con, present) -> list[Check]:
     """``FIPS_CODE`` mixes four incompatible formats; only one is a county FIPS.
 
@@ -186,8 +241,6 @@ def check_fips_shapes(con, present) -> list[Check]:
     zero disagreements no matter what the data said. A check that structurally
     cannot fail is worse than no check, because it manufactures confidence.
     """
-    if "facility" not in present:
-        return []
     rows = con.execute(
         """
         SELECT CASE
@@ -203,11 +256,10 @@ def check_fips_shapes(con, present) -> list[Check]:
     shapes = dict(rows)
     nonnull = sum(n for sh, n in rows if sh != "null")
     usable = shapes.get("county_fips_5", 0)
-    unusable = nonnull - usable
     out = [
         Check(
             "facility.fips_code_shapes",
-            "ok" if unusable == 0 else "warn",
+            "ok" if nonnull == usable else "warn",
             f"{usable:,} usable of {nonnull:,} non-null",
             "FIPS_CODE mixes formats; only 5-digit numeric is a county FIPS",
             rows=rows,
@@ -230,10 +282,9 @@ def check_fips_shapes(con, present) -> list[Check]:
     return out
 
 
+@requires("facility")
 def check_coordinates(con, present) -> list[Check]:
     """Coordinate coverage, and range sanity when there is anything to check."""
-    if "facility" not in present:
-        return []
     total, has = con.execute("SELECT count(*), count(LATITUDE83) FROM facility").fetchone()
     pct = 100.0 * has / total if total else 0
     out = [
@@ -249,7 +300,7 @@ def check_coordinates(con, present) -> list[Check]:
         # health for data that does not exist.
         out.append(
             Check(
-                "facility.coordinates_outside_us",
+                "facility.coordinates_unusable",
                 "warn",
                 "not applicable",
                 "no coordinates in this extract; the range check cannot run. "
@@ -257,29 +308,37 @@ def check_coordinates(con, present) -> list[Check]:
             )
         )
         return out
+    # `LONGITUDE83 IS NULL` must be explicit: in SQL's three-valued logic a NULL
+    # longitude makes the OR evaluate to NULL for any in-range latitude, so a
+    # facility with a latitude and no longitude - unmappable - would count as fine.
     off = con.execute(
         "SELECT count(*) FROM facility WHERE LATITUDE83 IS NOT NULL "
-        "AND (LATITUDE83 NOT BETWEEN 17 AND 72 OR LONGITUDE83 NOT BETWEEN -180 AND -64)"
+        "AND (LONGITUDE83 IS NULL "
+        "     OR LATITUDE83 NOT BETWEEN 17 AND 72 "
+        "     OR LONGITUDE83 NOT BETWEEN -180 AND -64)"
     ).fetchone()[0]
     out.append(
         Check(
-            "facility.coordinates_outside_us",
+            "facility.coordinates_unusable",
             "ok" if off == 0 else "warn",
             off,
-            "coordinates outside a generous US bounding box",
+            "latitude present but the point is unusable: no longitude, or "
+            "outside a generous US bounding box",
         )
     )
     return out
 
 
 def check_source_mojibake(con, present) -> list[Check]:
-    """U+FFFD characters EPA shipped in the source text.
+    """U+FFFD characters in the ingested text.
 
-    A replacement character in a published file means the corruption happened
-    upstream, in EPA's own extract pipeline, and the original characters are
-    unrecoverable from this file. Worth knowing before trusting a name match.
+    A replacement character means some byte was already unrecoverable by the
+    time it reached this table. It is attributable to EPA when ``j2d frs
+    ingest`` reported no repairs of its own — the ingest log prints both
+    ``[N U+FFFD already in source]`` and, separately, ``[utf8 repaired]``, and
+    on the current extract only the former appears. The two are indistinguishable
+    *here*, which is why the ingest counts them at the source.
     """
-    out = []
     targets = [
         ("facility", "PRIMARY_NAME"),
         ("facility", "LOCATION_ADDRESS"),
@@ -290,31 +349,32 @@ def check_source_mojibake(con, present) -> list[Check]:
     total = 0
     rows = []
     for table, col in targets:
-        if table not in present:
+        if f"raw_{table}" not in present:
             continue
-        n = con.execute(
-            f"SELECT count(*) FROM raw_{table} WHERE contains(\"{col}\", chr(65533))"
-        ).fetchone()[0]
+        try:
+            n = con.execute(
+                f'SELECT count(*) FROM raw_{table} WHERE contains("{col}", chr(65533))'
+            ).fetchone()[0]
+        except Exception:  # noqa: BLE001 - one column must not cost the check
+            continue
         if n:
             rows.append((f"{table}.{col}", n))
         total += n
-    out.append(
+    return [
         Check(
-            "source.mojibake_rows",
+            "text.replacement_characters",
             "ok" if total == 0 else "warn",
             total,
-            "rows whose text already contains U+FFFD as published by EPA; "
-            "the original characters are not recoverable from this file",
+            "rows whose text contains U+FFFD; the original characters are not "
+            "recoverable. Attributable to EPA when the ingest log reports no repairs.",
             rows=rows,
         )
-    )
-    return out
+    ]
 
 
+@requires("crosswalk")
 def check_crosswalk_agreement(con, present) -> list[Check]:
     """Do the two independent representations of the links agree?"""
-    if "crosswalk" not in present:
-        return []
     rows = con.execute(
         """
         SELECT
@@ -343,12 +403,13 @@ def check_crosswalk_agreement(con, present) -> list[Check]:
     ]
 
 
+@requires("crosswalk")
 def check_single_source_links(con, present) -> list[Check]:
-    if "crosswalk" not in present:
-        return []
     n, total = con.execute(
         "SELECT sum(CASE WHEN source_table_count = 1 THEN 1 ELSE 0 END), count(*) FROM crosswalk"
     ).fetchone()
+    # sum() over an empty table is NULL, not 0.
+    n = n or 0
     return [
         Check(
             "crosswalk.single_source_links",
@@ -374,13 +435,23 @@ ALL_CHECKS = (
 
 
 def run(con: duckdb.DuckDBPyConnection, *, checks=ALL_CHECKS) -> list[Check]:
-    present = _views(con)
+    """Run every check, keeping the report's shape stable."""
+    present = _relations(con)
     out: list[Check] = []
     for fn in checks:
-        try:
-            out.extend(fn(con, present))
-        except duckdb.Error as exc:  # a broken check must not kill the report
-            out.append(Check(fn.__name__, "fail", "error", str(exc)[:200]))
+        needed = getattr(fn, "requires", ())
+        missing = [t for t in needed if t not in present]
+        if missing:
+            out.append(
+                Check(
+                    f"skipped.{fn.__name__}",
+                    "warn",
+                    "not run",
+                    f"requires {', '.join(missing)}, which the database does not have",
+                )
+            )
+            continue
+        out.extend(_safe(fn, con, present))
     return out
 
 

@@ -42,6 +42,7 @@ class IngestResult:
     seconds: float
     encoding_fallback: bool = False
     control_bytes_removed: int = 0
+    source_replacement_chars: int = 0
 
     @property
     def rows_per_second(self) -> float:
@@ -125,6 +126,14 @@ class _TextSanitiser(io.RawIOBase):
         #: file was published. Counting output characters would report those as
         #: our repairs and make the diagnostic useless.
         self.invalid_bytes_replaced = 0
+        #: U+FFFD sequences already encoded in the *source* bytes. These are
+        #: EPA's, not ours: a replacement character in a published file means
+        #: the corruption happened upstream and the original characters are not
+        #: recoverable from this download. Counting them here rather than in the
+        #: output is the only way to tell the two apart, because both look
+        #: identical once decoded.
+        self.source_replacement_chars = 0
+        self._carry = b""
         self._handler = _ReplaceCounter()
         name = f"j2d.frs.replace.{next(_HANDLER_SEQ)}"
         codecs.register_error(name, self._handler)
@@ -145,6 +154,11 @@ class _TextSanitiser(io.RawIOBase):
             if chunk:
                 stripped = chunk.translate(None, _CONTROL_BYTES)
                 self.control_bytes_removed += len(chunk) - len(stripped)
+                # Count encoded U+FFFD in the source, carrying two bytes across
+                # the boundary so a split sequence is not missed or double-counted.
+                scan = self._carry + stripped
+                self.source_replacement_chars += scan.count(b"\xef\xbf\xbd")
+                self._carry = scan[-2:] if len(scan) >= 2 else scan
                 text = self._decoder.decode(stripped)
             else:
                 self._eof = True
@@ -262,6 +276,7 @@ def ingest_table(
                     writer.close()
             repaired = sanitiser.utf8_repaired
             removed = sanitiser.control_bytes_removed
+            source_fffd = sanitiser.source_replacement_chars
 
     if rows == 0 and not tmp_path.exists():
         raise RuntimeError(f"{table.member}: produced no rows")
@@ -277,6 +292,7 @@ def ingest_table(
         seconds=time.time() - started,
         encoding_fallback=repaired,
         control_bytes_removed=removed,
+        source_replacement_chars=source_fffd,
     )
 
 
@@ -313,6 +329,8 @@ def ingest_all(
                 f"  {res.seconds:>6.1f}s"
                 + ("  [utf8 repaired]" if res.encoding_fallback else "")
                 + (f"  [{res.control_bytes_removed} control bytes removed]" if res.control_bytes_removed else "")
+                + (f"  [{res.source_replacement_chars} U+FFFD already in source]"
+                   if res.source_replacement_chars else "")
             )
         results.append(res)
     return results

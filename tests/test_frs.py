@@ -576,3 +576,97 @@ def test_qa_never_raises_on_a_missing_table():
     con = duckdb.connect()
     checks = qa.run(con)
     assert all(c.status in ("ok", "warn", "fail") for c in checks)
+
+
+def test_a_skipped_check_is_reported_not_omitted():
+    """An absent line and a passing line look identical in a monthly diff."""
+    con = duckdb.connect()
+    names = {c.name for c in qa.run(con)}
+    assert "skipped.check_facility_key_unique" in names
+    assert "skipped.check_crosswalk_agreement" in names
+    assert all(c.status == "warn" for c in qa.run(con) if c.name.startswith("skipped."))
+
+
+def test_one_broken_check_costs_one_line_not_the_report():
+    """run() must survive a plain Python error, not just duckdb.Error."""
+
+    def exploding(con, present):
+        raise ValueError("boom")
+
+    checks = qa.run(duckdb.connect(), checks=(exploding, qa.check_row_counts))
+    assert any(c.name == "exploding" and c.status == "fail" for c in checks)
+    assert any(c.name.startswith("rows.") for c in checks), "other checks must still run"
+
+
+def test_single_source_links_survives_an_empty_crosswalk():
+    """sum() over an empty table is NULL, and f'{None:,}' raises TypeError."""
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE crosswalk (REGISTRY_ID VARCHAR, PGM_SYS_ACRNM VARCHAR, "
+        "PGM_SYS_ID VARCHAR, source_table_count BIGINT, source_tables VARCHAR[])"
+    )
+    checks = qa.run(con, checks=(qa.check_single_source_links,))
+    assert checks[0].status == "ok"
+    assert checks[0].value == "0 / 0"
+
+
+def test_relations_are_scoped_to_the_current_database(tmp_path):
+    """ATTACHing last month's database must not fake this month's relations."""
+    other = tmp_path / "prev.duckdb"
+    o = duckdb.connect(str(other))
+    o.execute("CREATE TABLE crosswalk (a INTEGER)")
+    o.close()
+    con = duckdb.connect()
+    con.execute(f"ATTACH '{other}' AS prev (READ_ONLY)")
+    names = {c.name for c in qa.run(con)}
+    assert "skipped.check_crosswalk_agreement" in names, (
+        "crosswalk lives in the attached catalog, not this one"
+    )
+
+
+def test_state_code_total_is_not_truncated_by_the_sample_limit(tmp_path):
+    """The headline must count every bad code, not just the top 20 distinct."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    d = tmp_path / "pq"
+    d.mkdir()
+    bad = [f"Z{i:02d}" for i in range(30)]  # 30 distinct out-of-domain codes
+    pq.write_table(
+        pa.table(
+            {
+                "REGISTRY_ID": [str(i) for i in range(30)],
+                "STATE_CODE": bad,
+                "FIPS_CODE": ["39155"] * 30,
+            }
+        ),
+        d / "facility.parquet",
+    )
+    con = duckdb.connect()
+    db.build_views(con, d)
+    checks = qa.run(con, checks=(qa.check_state_codes,))
+    assert checks[0].value == 30, "summing the LIMIT 20 sample would report 20"
+    assert len(checks[0].rows) == 20, "the printed sample stays capped"
+
+
+def test_coordinates_flag_a_latitude_with_no_longitude(tmp_path):
+    """Three-valued logic would let an unmappable facility pass as fine."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    d = tmp_path / "pq"
+    d.mkdir()
+    pq.write_table(
+        pa.table(
+            {
+                "REGISTRY_ID": ["1", "2"],
+                "LATITUDE83": ["41.18", "41.18"],
+                "LONGITUDE83": ["-80.76", "0"],  # 0 is the null-island marker
+            }
+        ),
+        d / "facility.parquet",
+    )
+    con = duckdb.connect()
+    db.build_views(con, d)
+    checks = {c.name: c for c in qa.run(con, checks=(qa.check_coordinates,))}
+    assert checks["facility.coordinates_unusable"].value == 1
